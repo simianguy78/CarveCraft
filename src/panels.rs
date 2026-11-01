@@ -295,6 +295,13 @@ impl App {
             ui.label("4. Save the toolpaths as G-code for your machine.");
             ui.separator();
             ui.label("Wheel = zoom · right-drag = pan · left-drag in 3D = orbit");
+            ui.separator();
+            if ui.button("Quick guide").clicked() {
+                self.show_guide = true;
+                ui.close_menu();
+            }
+            ui.hyperlink_to("CarveCraft on GitHub", crate::start::GITHUB_URL);
+            ui.hyperlink_to("Report a problem", format!("{}/issues", crate::start::GITHUB_URL));
         });
     }
 

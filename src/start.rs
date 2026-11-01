@@ -5,6 +5,8 @@ use crate::theme::{self, ACCENT};
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, RichText, Sense, Shape, Stroke, Ui};
 use std::path::PathBuf;
 
+pub const GITHUB_URL: &str = "https://github.com/simianguy78/CarveCraft";
+
 fn recent_file() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("CarveCraft").join("recent.txt"))
 }
@@ -83,6 +85,13 @@ impl App {
             if let Some(p) = open {
                 self.open_path(p);
             }
+            heading(ui, "Online Resources");
+            if task(ui, dark, "import", "CarveCraft on GitHub") {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(GITHUB_URL));
+            }
+            if task(ui, dark, "delete", "Report a problem") {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{GITHUB_URL}/issues")));
+            }
             heading(ui, "Learn");
             if task(ui, dark, "text", "Quick guide") {
                 self.show_guide = true;
@@ -133,7 +142,7 @@ impl App {
             }
             x += w + 24.0;
         }
-        p.text(rect.left_bottom() + vec2(16.0, -16.0), Align2::LEFT_BOTTOM, "CarveCraft Studio 1.0 · 2D design, 3D modelling and toolpaths for CNC routers", FontId::proportional(12.0), pal.weak);
+        p.text(rect.left_bottom() + vec2(16.0, -16.0), Align2::LEFT_BOTTOM, "CarveCraft Studio 1.0 · 2D design, 3D modelling and toolpaths for CNC routers · github.com/simianguy78/CarveCraft", FontId::proportional(12.0), pal.weak);
         match clicked {
             Some(0) => self.new_doc(),
             Some(1) => {
