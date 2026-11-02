@@ -397,6 +397,221 @@ impl Field {
     }
 }
 
+// ---------------------------------------------------------------- vector editing
+
+impl Vector {
+    /// Bake the shape into an editable path (one outline only) with no rotation or scale.
+    pub fn to_path(&mut self) -> bool {
+        let polys = self.polys();
+        if polys.len() != 1 {
+            return false;
+        }
+        let poly = &polys[0];
+        let c = self.center;
+        self.kind = ShapeKind::Path { pts: poly.pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect(), closed: poly.closed };
+        self.angle = 0.0;
+        self.scale = vec2(1.0, 1.0);
+        true
+    }
+}
+
+/// Points of the circular arc from `a` through `m` to `b` (a straight line when they are in a row).
+pub fn arc_points(a: Pos2, m: Pos2, b: Pos2) -> Vec<Pos2> {
+    let d = 2.0 * (a.x * (m.y - b.y) + m.x * (b.y - a.y) + b.x * (a.y - m.y));
+    if d.abs() < 1e-6 {
+        return vec![a, b];
+    }
+    let (a2, m2, b2) = (a.to_vec2().length_sq(), m.to_vec2().length_sq(), b.to_vec2().length_sq());
+    let c = pos2(
+        (a2 * (m.y - b.y) + m2 * (b.y - a.y) + b2 * (a.y - m.y)) / d,
+        (a2 * (b.x - m.x) + m2 * (a.x - b.x) + b2 * (m.x - a.x)) / d,
+    );
+    let r = (a - c).length();
+    let ang = |p: Pos2| (p.y - c.y).atan2(p.x - c.x);
+    let tau = std::f32::consts::TAU;
+    let (a0, am, ab) = (ang(a), ang(m), ang(b));
+    let ccw = |x: f32| (x - a0).rem_euclid(tau);
+    // sweep counter-clockwise if m lies between a and b going that way, else clockwise
+    let sweep = if ccw(am) < ccw(ab) { ccw(ab) } else { ccw(ab) - tau };
+    let n = ((sweep.abs() * r / 0.5).ceil() as usize).clamp(8, 720);
+    (0..=n).map(|k| {
+        let t = a0 + sweep * k as f32 / n as f32;
+        pos2(c.x + r * t.cos(), c.y + r * t.sin())
+    })
+    .collect()
+}
+
+/// Union of closed shapes; each group is one shape (its own holes kept).
+pub fn weld(groups: &[Vec<Poly>]) -> Vec<Poly> {
+    let all: Vec<Poly> = groups.iter().flatten().cloned().collect();
+    let b = bounds_of(&all);
+    let cell = (b.width().max(b.height()) / 1500.0).clamp(0.02, 0.5);
+    let b = b.expand(cell * 3.0);
+    let nx = (b.width() / cell).ceil() as usize + 1;
+    let ny = (b.height() / cell).ceil() as usize + 1;
+    let mut field: Option<Field> = None;
+    for g in groups {
+        let f = Field::build_on(g, b.min, cell, nx, ny, cell * 4.0);
+        match &mut field {
+            None => field = Some(f),
+            Some(acc) => acc.d.iter_mut().zip(f.d).for_each(|(a, v)| *a = a.max(v)),
+        }
+    }
+    let Some(field) = field else { return Vec::new() };
+    field.contours(0.0).into_iter().map(|pts| Poly { pts: simplify(&pts, cell * 0.3), closed: true }).collect()
+}
+
+fn seg_cross(a: Pos2, b: Pos2, c: Pos2, d: Pos2) -> Option<f32> {
+    let r = b - a;
+    let s = d - c;
+    let den = r.x * s.y - r.y * s.x;
+    if den.abs() < 1e-9 {
+        return None;
+    }
+    let q = c - a;
+    let t = (q.x * s.y - q.y * s.x) / den;
+    let u = (q.x * r.y - q.y * r.x) / den;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some(t)
+}
+
+/// Distance along a polyline (from its first point) of the point nearest `p`.
+fn param_of(pts: &[Pos2], closed: bool, p: Pos2) -> f32 {
+    let poly = Poly { pts: pts.to_vec(), closed };
+    let (mut acc, mut best, mut bd) = (0.0, 0.0, f32::MAX);
+    for (a, b) in segments(&poly) {
+        let ab = b - a;
+        let l = ab.length();
+        let t = if l > 0.0 { ((p - a).dot(ab) / (l * l)).clamp(0.0, 1.0) } else { 0.0 };
+        let d = (a + ab * t - p).length();
+        if d < bd {
+            bd = d;
+            best = acc + t * l;
+        }
+        acc += l;
+    }
+    best
+}
+
+/// The part of a polyline between two distances along it (s0 < s1).
+fn sub_path(pts: &[Pos2], closed: bool, s0: f32, s1: f32) -> Vec<Pos2> {
+    let poly = Poly { pts: pts.to_vec(), closed };
+    let mut out = Vec::new();
+    let mut acc = 0.0;
+    for (a, b) in segments(&poly) {
+        let l = (b - a).length();
+        let (e0, e1) = (acc, acc + l);
+        if e1 >= s0 && e0 <= s1 && l > 0.0 {
+            if out.is_empty() {
+                out.push(a + (b - a) * ((s0 - e0) / l).clamp(0.0, 1.0));
+            }
+            if e1 <= s1 {
+                out.push(b);
+            } else {
+                out.push(a + (b - a) * ((s1 - e0) / l));
+                break;
+            }
+        }
+        acc = e1;
+    }
+    out
+}
+
+/// Remove the piece of `poly` around `click` that lies between its nearest crossings with
+/// `others`. Returns the pieces that remain, or None when nothing crosses it.
+pub fn trim(poly: &Poly, others: &[Poly], click: Pos2) -> Option<Vec<Poly>> {
+    let total: f32 = segments(poly).map(|(a, b)| (b - a).length()).sum();
+    let mut cuts = Vec::new();
+    let mut acc = 0.0;
+    for (a, b) in segments(poly) {
+        let l = (b - a).length();
+        for o in others {
+            for (c, d) in segments(o) {
+                if let Some(t) = seg_cross(a, b, c, d) {
+                    cuts.push(acc + t * l);
+                }
+            }
+        }
+        acc += l;
+    }
+    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    if cuts.is_empty() {
+        return None;
+    }
+    let s = param_of(&poly.pts, poly.closed, click);
+    let before = cuts.iter().copied().filter(|c| *c < s).last();
+    let after = cuts.iter().copied().find(|c| *c > s);
+    let piece = |a: f32, b: f32| Poly { pts: sub_path(&poly.pts, poly.closed, a, b), closed: false };
+    let mut out = Vec::new();
+    if poly.closed {
+        if cuts.len() < 2 {
+            return None;
+        }
+        let (lo, hi) = (before.unwrap_or(*cuts.last().unwrap() - total), after.unwrap_or(cuts[0] + total));
+        // keep the rest of the loop: from hi round to lo
+        let mut doubled = poly.pts.clone();
+        doubled.extend(poly.pts.iter().copied());
+        doubled.push(poly.pts[0]);
+        let (a, b) = if hi >= total { (hi - total, lo + total - total) } else { (hi, lo + total) };
+        let b = if b <= a { b + total } else { b };
+        out.push(Poly { pts: sub_path(&doubled, false, a, b), closed: false });
+    } else {
+        if let Some(b) = before {
+            out.push(piece(0.0, b));
+        }
+        if let Some(a) = after {
+            out.push(piece(a, total));
+        }
+    }
+    out.retain(|p| p.pts.len() >= 2 && poly_length(&p.pts) > 1e-3);
+    Some(out)
+}
+
+/// Round the corner at vertex `i` with radius `r`. Returns false if it is not a corner.
+pub fn fillet_corner(pts: &mut Vec<Pos2>, closed: bool, i: usize, r: f32) -> bool {
+    let n = pts.len();
+    if n < 3 || (!closed && (i == 0 || i == n - 1)) {
+        return false;
+    }
+    let p = pts[i];
+    let (a, b) = (pts[(i + n - 1) % n], pts[(i + 1) % n]);
+    let (u, v) = ((a - p).normalized(), (b - p).normalized());
+    let cos = u.dot(v).clamp(-1.0, 1.0);
+    let theta = cos.acos();
+    if theta > std::f32::consts::PI - 0.02 || theta < 0.01 {
+        return false;
+    }
+    let t = (r / (theta * 0.5).tan()).min((a - p).length() * 0.5).min((b - p).length() * 0.5);
+    let r = t * (theta * 0.5).tan();
+    let (s, e) = (p + u * t, p + v * t);
+    let bis = (u + v).normalized();
+    let mid = p + bis * (t / (theta * 0.5).cos() - r);
+    let arc = arc_points(s, mid, e);
+    pts.splice(i..=i, arc);
+    true
+}
+
+/// Round every corner of a path sharper than about 170°.
+pub fn fillet_all(pts: &[Pos2], closed: bool, r: f32) -> Vec<Pos2> {
+    let mut out = pts.to_vec();
+    let mut i = if closed { 0 } else { 1 };
+    while i < out.len() {
+        let before = out.len();
+        let n = out.len();
+        let (a, p, b) = (out[(i + n - 1) % n], out[i], out[(i + 1) % n]);
+        let sharp = (a - p).normalized().dot((b - p).normalized()) > -0.985;
+        if sharp && fillet_corner(&mut out, closed, i, r) {
+            i += out.len() - before + 1;
+        } else {
+            i += 1;
+        }
+        if !closed && i >= out.len() - 1 {
+            break;
+        }
+    }
+    out
+}
+
 /// Ramer–Douglas–Peucker simplification.
 pub fn simplify(pts: &[Pos2], tol: f32) -> Vec<Pos2> {
     if pts.len() < 3 {
@@ -551,5 +766,58 @@ mod tests {
         let p = super::text_outlines("WELCOME", 18.0);
         eprintln!("polys {} bounds {:?}", p.len(), super::bounds_of(&p));
         assert!(!p.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    fn square(c: Pos2, h: f32) -> Poly {
+        Poly { pts: vec![pos2(c.x - h, c.y - h), pos2(c.x + h, c.y - h), pos2(c.x + h, c.y + h), pos2(c.x - h, c.y + h)], closed: true }
+    }
+
+    #[test]
+    fn arc_through_three_points() {
+        let pts = arc_points(pos2(-10.0, 0.0), pos2(0.0, 10.0), pos2(10.0, 0.0));
+        assert!(pts.iter().all(|p| (p.to_vec2().length() - 10.0).abs() < 1e-3));
+        assert!(pts.iter().all(|p| p.y >= -1e-3), "arc should pass over the top");
+    }
+
+    #[test]
+    fn weld_two_overlapping_squares() {
+        let out = weld(&[vec![square(pos2(0.0, 0.0), 10.0)], vec![square(pos2(10.0, 0.0), 10.0)]]);
+        assert_eq!(out.len(), 1);
+        let b = bounds_of(&out);
+        assert!((b.width() - 30.0).abs() < 0.3 && (b.height() - 20.0).abs() < 0.3, "{b:?}");
+    }
+
+    #[test]
+    fn trim_open_line_between_crossings() {
+        let line = Poly { pts: vec![pos2(0.0, 0.0), pos2(30.0, 0.0)], closed: false };
+        let cutters = [Poly { pts: vec![pos2(10.0, -5.0), pos2(10.0, 5.0)], closed: false }, Poly { pts: vec![pos2(20.0, -5.0), pos2(20.0, 5.0)], closed: false }];
+        let out = trim(&line, &cutters, pos2(15.0, 0.0)).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!((poly_length(&out[0].pts) - 10.0).abs() < 1e-3 && (poly_length(&out[1].pts) - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn trim_closed_square_keeps_the_rest() {
+        let sq = square(pos2(0.0, 0.0), 10.0);
+        let cutter = [Poly { pts: vec![pos2(5.0, -20.0), pos2(5.0, 20.0)], closed: false }];
+        let out = trim(&sq, &cutter, pos2(10.0, 0.0)).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((poly_length(&out[0].pts) - 50.0).abs() < 1e-2, "{}", poly_length(&out[0].pts));
+    }
+
+    #[test]
+    fn fillet_rounds_square_corner() {
+        let mut pts = square(pos2(0.0, 0.0), 10.0).pts;
+        assert!(fillet_corner(&mut pts, true, 2, 4.0));
+        assert!(pts.iter().all(|p| p.x <= 10.0 + 1e-3 && p.y <= 10.0 + 1e-3));
+        let far = pts.iter().filter(|p| p.x > 0.0 && p.y > 0.0).map(|p| p.to_vec2().length()).fold(0.0, f32::max);
+        assert!(far < 10.0 * 2f32.sqrt() - 1.0, "corner should be cut");
+        let all = fillet_all(&square(pos2(0.0, 0.0), 10.0).pts, true, 3.0);
+        assert!(all.len() > 20);
     }
 }

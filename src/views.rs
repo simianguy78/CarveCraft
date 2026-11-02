@@ -211,7 +211,28 @@ impl App {
             }
             _ => {}
         }
-        if !self.poly_pts.is_empty() {
+        if self.tool == DrawTool::Arc && !self.poly_pts.is_empty() {
+            let h = hover_j.map(|h| self.snap_pt(h));
+            let q = &self.poly_pts;
+            let line = match (q.len(), h) {
+                (1, Some(h)) => vec![q[0], h],
+                (2, Some(h)) => geom::arc_points(q[0], h, q[1]),
+                _ => q.clone(),
+            };
+            painter.add(Shape::line(line.iter().map(|p| to_s(*p)).collect(), preview));
+            for p in q {
+                painter.circle_filled(to_s(*p), 3.5, ACCENT);
+            }
+        } else if self.tool == DrawTool::Node {
+            if let Some((_, pts, _)) = self.node_points() {
+                let active = if let Drag::Node { idx, .. } = self.drag { Some(idx) } else { None };
+                for (i, p) in pts.iter().enumerate() {
+                    let r = Rect::from_center_size(to_s(*p), vec2(7.0, 7.0));
+                    painter.rect_filled(r, CornerRadius::ZERO, if active == Some(i) { ACCENT } else { pal.sheet });
+                    painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.2_f32, ACCENT), egui::StrokeKind::Middle);
+                }
+            }
+        } else if !self.poly_pts.is_empty() {
             let mut pts: Vec<Pos2> = self.poly_pts.iter().map(|p| to_s(*p)).collect();
             if let Some(h) = hover_j {
                 pts.push(to_s(self.snap_pt(h)));
@@ -290,6 +311,10 @@ impl App {
             DrawTool::Polyline => "Click to add points · click the first point to close · double-click or Enter to finish",
             DrawTool::Freehand => "Drag to sketch · finish near the start to close the shape",
             DrawTool::Text => "Click where the text should go",
+            DrawTool::Arc => "Click the start, then the end, then a point the arc passes through",
+            DrawTool::Node => "Drag nodes to reshape · double-click a line to add a node, a node to delete it · click another shape to edit it",
+            DrawTool::Trim => "Click the piece of a vector to cut away between the lines that cross it",
+            DrawTool::Fillet => "Click a corner to round it · radius is in the Draw card",
             DrawTool::Sculpt => "Paint on the model · brush size and strength are in the Sculpt card",
         };
         let hr = Rect::from_min_size(rect.left_bottom() + vec2(12.0, -34.0), vec2(rect.width() - 24.0, 24.0));
@@ -462,6 +487,38 @@ impl App {
                     }
                 }
             }
+            DrawTool::Arc => {
+                if resp.clicked() {
+                    if let Some(p) = pos {
+                        self.poly_pts.push(self.snap_pt(p));
+                        if self.poly_pts.len() == 3 {
+                            let q = std::mem::take(&mut self.poly_pts);
+                            self.push_undo();
+                            let id = self.add_path(geom::arc_points(q[0], q[2], q[1]), false);
+                            self.sel = vec![id];
+                            self.toast("Arc added");
+                        }
+                    }
+                }
+            }
+            DrawTool::Node => {
+                let press = resp.ctx.input(|i| i.pointer.press_origin()).map(&to_j);
+                self.node_input(resp, pos, press, tol)
+            }
+            DrawTool::Trim => {
+                if resp.clicked() {
+                    if let Some(p) = pos {
+                        self.trim_at(p, tol);
+                    }
+                }
+            }
+            DrawTool::Fillet => {
+                if resp.clicked() {
+                    if let Some(p) = pos {
+                        self.fillet_at(p, tol * 1.5);
+                    }
+                }
+            }
             DrawTool::Sculpt => {
                 if resp.drag_started_by(PointerButton::Primary) || resp.clicked() {
                     self.push_undo();
@@ -481,6 +538,157 @@ impl App {
                     self.invalidate_sim();
                 }
             }
+        }
+    }
+
+    fn visible_vector(&self, v: &geom::Vector) -> bool {
+        self.doc.layers.get(v.layer).map(|l| l.visible).unwrap_or(true)
+    }
+
+    /// The nearest visible vector whose outline passes within `tol` of `p`.
+    fn hit_edge(&self, p: Pos2, tol: f32) -> Option<u64> {
+        let mut best: Option<(f32, u64)> = None;
+        for v in self.doc.vectors.iter().filter(|v| self.visible_vector(v)) {
+            let d = geom::dist_to_polys(p, &v.polys());
+            if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, v.id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// World positions of the nodes of the vector being node-edited.
+    fn node_points(&self) -> Option<(u64, Vec<Pos2>, bool)> {
+        let id = *self.sel.first()?;
+        let v = self.doc.vectors.iter().find(|v| v.id == id)?;
+        let polys = v.polys();
+        (polys.len() == 1).then(|| (id, polys[0].pts.clone(), polys[0].closed))
+    }
+
+    fn node_input(&mut self, resp: &egui::Response, pos: Option<Pos2>, press: Option<Pos2>, tol: f32) {
+        let near_node = |app: &App, p: Pos2| {
+            let (id, pts, _) = app.node_points()?;
+            pts.iter().enumerate().map(|(i, q)| ((*q - p).length(), i)).filter(|(d, _)| *d <= tol).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, i)| (id, i))
+        };
+        let with_path = |app: &mut App, id: u64, f: &mut dyn FnMut(&mut Vec<Pos2>, bool, Pos2)| {
+            if let Some(v) = app.doc.vectors.iter_mut().find(|v| v.id == id) {
+                if v.to_path() {
+                    let c = v.center;
+                    if let ShapeKind::Path { pts, closed } = &mut v.kind {
+                        f(pts, *closed, c);
+                    }
+                }
+            }
+        };
+        if resp.double_clicked() {
+            let Some(p) = pos else { return };
+            if let Some((id, i)) = near_node(self, p) {
+                self.push_undo();
+                with_path(self, id, &mut |pts, closed, _| {
+                    if pts.len() > if closed { 3 } else { 2 } {
+                        pts.remove(i);
+                    }
+                });
+            } else if let Some((id, pts, closed)) = self.node_points() {
+                let poly = geom::Poly { pts, closed };
+                if geom::dist_to_polys(p, std::slice::from_ref(&poly)) <= tol {
+                    let q = geom::closest_on_poly(p, &poly);
+                    let seg = geom::segments(&poly).enumerate().min_by(|a, b| geom::seg_dist(q, a.1 .0, a.1 .1).total_cmp(&geom::seg_dist(q, b.1 .0, b.1 .1))).map(|(k, _)| k);
+                    if let Some(k) = seg {
+                        self.push_undo();
+                        with_path(self, id, &mut |pts, _, c| pts.insert(k + 1, pos2(q.x - c.x, q.y - c.y)));
+                    }
+                }
+            }
+            return;
+        }
+        if resp.drag_started_by(PointerButton::Primary) {
+            if let Some(p) = press {
+                if let Some((id, idx)) = near_node(self, p) {
+                    self.push_undo();
+                    with_path(self, id, &mut |_, _, _| {});
+                    self.drag = Drag::Node { id, idx };
+                }
+            }
+        }
+        if resp.dragged_by(PointerButton::Primary) {
+            if let (Drag::Node { id, idx }, Some(p)) = (&self.drag, pos) {
+                let (id, idx, p) = (*id, *idx, self.snap_pt(p));
+                with_path(self, id, &mut |pts, _, c| {
+                    if let Some(q) = pts.get_mut(idx) {
+                        *q = pos2(p.x - c.x, p.y - c.y);
+                    }
+                });
+            }
+        }
+        if resp.drag_stopped_by(PointerButton::Primary) {
+            self.drag = Drag::None;
+        }
+        if resp.clicked() {
+            if let Some(p) = pos {
+                if near_node(self, p).is_none() {
+                    self.sel = self.hit_vector(p, tol).into_iter().collect();
+                }
+            }
+        }
+    }
+
+    fn trim_at(&mut self, p: Pos2, tol: f32) {
+        let Some(id) = self.hit_edge(p, tol) else { return };
+        let Some(v) = self.doc.vectors.iter().find(|v| v.id == id).cloned() else { return };
+        let polys = v.polys();
+        if polys.len() != 1 {
+            self.toast("Trim works on single outlines; text can't be trimmed");
+            return;
+        }
+        let others: Vec<geom::Poly> = self.doc.vectors.iter().filter(|o| o.id != id && self.visible_vector(o)).flat_map(|o| o.polys()).collect();
+        match geom::trim(&polys[0], &others, p) {
+            None => self.toast("Nothing crosses this vector here"),
+            Some(pieces) => {
+                self.push_undo();
+                self.doc.vectors.retain(|x| x.id != id);
+                self.sel.clear();
+                for piece in pieces {
+                    let nid = self.add_path(piece.pts, false);
+                    if let Some(n) = self.doc.vectors.iter_mut().find(|x| x.id == nid) {
+                        n.layer = v.layer;
+                    }
+                }
+            }
+        }
+    }
+
+    fn fillet_at(&mut self, p: Pos2, tol: f32) {
+        let mut best: Option<(f32, u64, usize)> = None;
+        for v in self.doc.vectors.iter().filter(|v| self.visible_vector(v)) {
+            let polys = v.polys();
+            if polys.len() != 1 {
+                continue;
+            }
+            for (i, q) in polys[0].pts.iter().enumerate() {
+                let d = (*q - p).length();
+                if d <= tol && best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, v.id, i));
+                }
+            }
+        }
+        let Some((_, id, i)) = best else {
+            self.toast("Click on a corner");
+            return;
+        };
+        self.push_undo();
+        let r = self.p.fillet_r;
+        let mut ok = false;
+        if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == id) {
+            if v.to_path() {
+                if let ShapeKind::Path { pts, closed } = &mut v.kind {
+                    ok = geom::fillet_corner(pts, *closed, i, r);
+                }
+            }
+        }
+        if !ok {
+            self.undo.pop();
+            self.toast("That point isn't a corner");
         }
     }
 

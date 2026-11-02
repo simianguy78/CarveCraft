@@ -596,8 +596,12 @@ impl App {
                 (DrawTool::Polygon, "polygon", "Polygon", "Drag from the centre"),
                 (DrawTool::Star, "star", "Star", "Drag from the centre"),
                 (DrawTool::Polyline, "polyline", "Polyline", "Click points; double-click or Enter to finish, click the first point to close"),
+                (DrawTool::Arc, "arc", "Arc", "Click start, end, then a point on the arc"),
                 (DrawTool::Freehand, "freehand", "Freehand", "Drag to sketch a curve"),
                 (DrawTool::Text, "text", "Text", "Click to place text"),
+                (DrawTool::Node, "node", "Node edit", "Drag a shape's points; double-click to add or delete"),
+                (DrawTool::Trim, "trim", "Trim", "Click a piece of a vector to cut it back to the lines crossing it"),
+                (DrawTool::Fillet, "fillet", "Fillet", "Click a corner to round it"),
             ];
             tiles(ui, |ui| {
                 for (t, icon, label, tip) in tools {
@@ -625,6 +629,12 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut self.p.text).hint_text("Text"));
                     num(ui, "Letter height", &mut self.p.text_size, 2.0..=500.0, " mm");
                 }
+                DrawTool::Fillet => {
+                    num(ui, "Radius", &mut self.p.fillet_r, 0.1..=500.0, " mm");
+                    if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Round all corners of selection")).clicked() {
+                        self.apply_fillet_all();
+                    }
+                }
                 _ => {}
             }
         });
@@ -642,6 +652,7 @@ impl App {
                         ("rotate", "Rotate 90°", "Rotate the selection by 90°"),
                         ("center", "Centre", "Move the selection to the middle of the job"),
                         ("offset", "Offset", "Make a bigger or smaller copy of the outline"),
+                        ("weld", "Weld", "Join overlapping closed shapes into one outline"),
                         ("circ_array", "Circular", "Copy around the job centre"),
                         ("grid_array", "Grid", "Copy in rows and columns"),
                     ];
@@ -675,6 +686,7 @@ impl App {
                 v.center += pos2(mw * 0.5, mh * 0.5) - c;
             }),
             Some("offset") => self.form = Some(Form::Offset),
+            Some("weld") => self.apply_weld(),
             Some("circ_array") => self.form = Some(Form::CircularArray),
             Some("grid_array") => self.form = Some(Form::GridArray),
             _ => {}

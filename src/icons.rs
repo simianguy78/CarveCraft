@@ -255,6 +255,52 @@ pub fn draw(p: &Painter, r: Rect, c: Color32, name: &str) {
                 p.add(Shape::line(pts, Stroke::new(1.4_f32, ACCENT)));
             }
         }
+        "arc" => {
+            let pts = (0..=24).map(|k| {
+                let a = std::f32::consts::PI * (0.1 + 0.8 * k as f32 / 24.0);
+                u(0.8 * a.cos(), 0.45 - 0.9 * a.sin())
+            });
+            p.add(Shape::line(pts.collect(), s));
+        }
+        "node" => {
+            let pts = vec![u(-0.75, 0.45), u(-0.15, -0.55), u(0.7, 0.3)];
+            p.add(Shape::line(pts.clone(), s));
+            for q in &pts {
+                p.rect_stroke(Rect::from_center_size(*q, vec2(6.0, 6.0)), 0.0, s, egui::StrokeKind::Middle);
+            }
+            p.rect_filled(Rect::from_center_size(pts[1], vec2(6.0, 6.0)), 0.0, ACCENT);
+        }
+        "weld" => {
+            p.circle_stroke(u(-0.28, 0.0), w * 0.3, Stroke::new(1.0_f32, c.gamma_multiply(0.45)));
+            p.circle_stroke(u(0.28, 0.0), w * 0.3, Stroke::new(1.0_f32, c.gamma_multiply(0.45)));
+            let a0 = (0.28f32 / 0.6).acos();
+            let mut pts = Vec::new();
+            for k in 0..=30 {
+                let a = a0 + (std::f32::consts::TAU - 2.0 * a0) * k as f32 / 30.0;
+                pts.push(u(0.28 + 0.6 * a.cos(), 0.6 * a.sin()));
+            }
+            for k in 0..=30 {
+                let a = std::f32::consts::PI + a0 - (std::f32::consts::TAU - 2.0 * a0) * k as f32 / 30.0 + std::f32::consts::TAU;
+                pts.push(u(-0.28 + 0.6 * a.cos(), 0.6 * -a.sin()));
+            }
+            p.add(Shape::closed_line(pts, s));
+        }
+        "trim" => {
+            p.line_segment([u(-0.8, 0.0), u(-0.25, 0.0)], s);
+            p.line_segment([u(0.25, 0.0), u(0.8, 0.0)], s);
+            p.line_segment([u(-0.25, -0.7), u(-0.25, 0.7)], Stroke::new(1.0_f32, c.gamma_multiply(0.6)));
+            p.line_segment([u(0.25, -0.7), u(0.25, 0.7)], Stroke::new(1.0_f32, c.gamma_multiply(0.6)));
+            p.extend(Shape::dashed_line(&[u(-0.25, 0.0), u(0.25, 0.0)], Stroke::new(1.2_f32, ACCENT), 2.0, 2.0));
+        }
+        "fillet" => {
+            let mut pts = vec![u(-0.7, 0.7), u(-0.7, -0.1)];
+            for k in 0..=10 {
+                let a = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * k as f32 / 10.0;
+                pts.push(u(-0.1 + 0.6 * a.cos(), -0.1 + 0.6 * a.sin()));
+            }
+            pts.push(u(0.7, -0.7));
+            p.add(Shape::line(pts, s));
+        }
         "texture_tp" => {
             for (x, y, a) in [(-0.45, -0.4, 0.3f32), (0.3, -0.5, -0.2), (-0.1, 0.05, 0.1), (0.5, 0.25, 0.4), (-0.55, 0.45, -0.3), (0.1, 0.6, 0.2)] {
                 let d = vec2(a.cos(), a.sin()) * w * 0.18;

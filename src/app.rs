@@ -74,8 +74,12 @@ pub enum DrawTool {
     Polygon,
     Star,
     Polyline,
+    Arc,
     Freehand,
     Text,
+    Node,
+    Trim,
+    Fillet,
     Sculpt,
 }
 
@@ -131,6 +135,7 @@ pub struct Params {
     pub brush_size: f32,
     pub brush_strength: f32,
     pub img_height: f32,
+    pub fillet_r: f32,
 }
 
 impl Default for Params {
@@ -166,6 +171,7 @@ impl Default for Params {
             brush_size: 10.0,
             brush_strength: 0.5,
             img_height: 8.0,
+            fillet_r: 5.0,
         }
     }
 }
@@ -179,6 +185,7 @@ pub enum Drag {
     Create { start: Pos2 },
     Freehand { pts: Vec<Pos2> },
     Sculpt { target: f32 },
+    Node { id: u64, idx: usize },
 }
 
 pub struct App {
@@ -624,6 +631,49 @@ impl App {
         }
         self.sel = new;
         self.toast("Offset created");
+    }
+
+    pub fn apply_weld(&mut self) {
+        let groups: Vec<Vec<Poly>> = self.selected_vectors().iter().filter(|v| v.is_closed()).map(|v| v.polys()).collect();
+        if groups.len() < 2 {
+            self.toast("Select two or more closed shapes to weld");
+            return;
+        }
+        self.push_undo();
+        let sel = self.sel.clone();
+        let layer = self.selected_vectors().first().map(|v| v.layer).unwrap_or(self.active_layer);
+        self.doc.vectors.retain(|v| !(sel.contains(&v.id) && v.is_closed()));
+        let mut new = Vec::new();
+        for l in geom::weld(&groups) {
+            let id = self.add_path(l.pts, true);
+            if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == id) {
+                v.layer = layer;
+            }
+            new.push(id);
+        }
+        self.toast(format!("Welded {} shapes into {}", groups.len(), new.len()));
+        self.sel = new;
+    }
+
+    /// Round every corner of the selected shapes.
+    pub fn apply_fillet_all(&mut self) {
+        if self.sel.is_empty() {
+            self.toast("Select shapes to round their corners");
+            return;
+        }
+        self.push_undo();
+        let (sel, r) = (self.sel.clone(), self.p.fillet_r);
+        let mut skipped = 0;
+        for v in self.doc.vectors.iter_mut().filter(|v| sel.contains(&v.id)) {
+            if !v.to_path() {
+                skipped += 1;
+                continue;
+            }
+            if let ShapeKind::Path { pts, closed } = &mut v.kind {
+                *pts = geom::fillet_all(pts, *closed, r);
+            }
+        }
+        self.toast(if skipped > 0 { format!("Corners rounded ({skipped} multi-outline shape(s) skipped)") } else { "Corners rounded".to_string() });
     }
 
     pub fn apply_circular_array(&mut self) {
