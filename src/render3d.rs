@@ -115,18 +115,20 @@ pub fn draw_surface(painter: &Painter, proj: &Projector, s: &Surface) {
     if nx < 2 || ny < 2 || s.heights.len() != nx * ny {
         return;
     }
-    let step = ((nx.max(ny) as f32) / 170.0).ceil().max(1.0) as usize;
+    let step = ((nx.max(ny) as f32) / 330.0).ceil().max(1.0) as usize;
     let xs: Vec<usize> = (0..nx).step_by(step).chain(std::iter::once(nx - 1)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let ys: Vec<usize> = (0..ny).step_by(step).chain(std::iter::once(ny - 1)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let (vw, vh) = (xs.len(), ys.len());
     let mut mesh = Mesh::with_texture(s.texture);
     let mut depth = Vec::with_capacity(vw * vh);
+    let mut zs = Vec::with_capacity(vw * vh);
     let wx = |i: usize| (i as f32 + 0.5) * s.cell;
     for &j in &ys {
         for &i in &xs {
             let z = s.heights[j * nx + i];
             let (p, d) = proj.project(wx(i), wx(j), z);
             depth.push(d);
+            zs.push(z);
             mesh.vertices.push(egui::epaint::Vertex {
                 pos: p,
                 uv: pos2((i as f32 + 0.5) / nx as f32, 1.0 - (j as f32 + 0.5) / ny as f32),
@@ -141,10 +143,14 @@ pub fn draw_surface(painter: &Painter, proj: &Projector, s: &Surface) {
             let i1 = i0 + 1;
             let i2 = i0 + vw as u32;
             let i3 = i2 + 1;
-            let d1 = depth[i0 as usize] + depth[i1 as usize] + depth[i3 as usize];
-            let d2 = depth[i0 as usize] + depth[i3 as usize] + depth[i2 as usize];
-            tris.push((d1, [i0, i1, i3]));
-            tris.push((d2, [i0, i3, i2]));
+            // Split along the diagonal whose ends are closest in height, so steep
+            // walls (cut edges, groove sides) don't turn into long spiky triangles.
+            let z = |k: u32| zs[k as usize];
+            let d = |a: u32, b: u32, c: u32| depth[a as usize] + depth[b as usize] + depth[c as usize];
+            let pair = if (z(i0) - z(i3)).abs() <= (z(i1) - z(i2)).abs() { [[i0, i1, i3], [i0, i3, i2]] } else { [[i0, i1, i2], [i1, i3, i2]] };
+            for t in pair {
+                tris.push((d(t[0], t[1], t[2]), t));
+            }
         }
     }
     tris.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
