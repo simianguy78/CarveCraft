@@ -327,3 +327,38 @@ pub fn sample_doc() -> Doc {
     tp(&mut d, "Profile cut-out", Op::Profile { depth: 20.0, side: Side::Outside }, &tools[0], plate.polys(), true);
     d
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_3d_paths_gcode_and_save_roundtrip() {
+        let mut d = sample_doc();
+        let tools = Tool::defaults();
+        for (op, tool) in [
+            (Op::Rough3D { allowance: 0.5 }, &tools[0]),
+            (Op::Finish3D, &tools[2]),
+            (Op::Texture { depth: 1.0, length: 12.0 }, &tools[3]),
+        ] {
+            let ch = crate::toolpath::generate(&op, tool, &[], &d.model, &d.material);
+            let pts: usize = ch.iter().map(|c| c.len()).sum();
+            eprintln!("{:<12} chains {:5} points {:7}", op.label(), ch.len(), pts);
+            assert!(!ch.is_empty(), "{} produced nothing", op.label());
+            assert!(ch.iter().flatten().all(|p| p[2] >= -d.material.thickness - 1e-3), "{} cuts below the material", op.label());
+        }
+        let paths: Vec<&Toolpath> = d.toolpaths.iter().collect();
+        let code = crate::toolpath::gcode(&paths, &d.material);
+        assert!(code.contains("G21") && code.contains("M30") && code.lines().count() > 100);
+        let json = serde_json::to_string(&d).unwrap();
+        let mut back: Doc = serde_json::from_str(&json).unwrap();
+        back.after_load();
+        assert_eq!(back.vectors.len(), d.vectors.len());
+        assert_eq!(back.model.components.len(), d.model.components.len());
+        assert!((back.model.max_height() - d.model.max_height()).abs() < 1e-3);
+        let mut sim = crate::toolpath::Sim::new(&d.material, &paths);
+        sim.finish();
+        assert!(sim.stock.z.iter().any(|z| *z < -1.0), "simulation removed nothing");
+        d.name.clear();
+    }
+}
