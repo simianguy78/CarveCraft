@@ -16,7 +16,8 @@ build 3D relief models, create toolpaths and save G-code.
   quick engrave, fluting, 3D roughing, 3D finishing and texture strokes, with an editable tool list
   (diameter, angle, stepover, pass depth, feed, plunge, RPM, flutes and chip load).
 - **Preview** – animated material-removal simulation in the 3D view, with speed and pause.
-- **Output** – generic G-code (mm, absolute) with Z zero on the material surface or the machine bed.
+- **Output** – G-code for GRBL, Mach3/UCCNC or LinuxCNC (mm or inch) with G2/G3 arcs, Z zero on
+  the material surface or the machine bed. Profile and pocket outlines use exact Clipper2 offsets.
 - Dark and light themes. Jobs are saved as `.ccj` files.
 
 See [FEATURES.md](FEATURES.md) for a CAM feature checklist against VCarve Pro and Aspire.
