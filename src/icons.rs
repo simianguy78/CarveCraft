@@ -13,6 +13,28 @@ pub fn draw(p: &Painter, r: Rect, c: Color32, name: &str) {
         "select" => {
             p.add(Shape::convex_polygon(vec![u(-0.45, -0.7), u(0.45, 0.15), u(0.0, 0.2), u(-0.2, 0.7)], c, Stroke::NONE));
         }
+        "job" => {
+            // material block with a dashed outline, like a job sheet
+            p.add(poly(vec![u(-0.7, -0.2), u(0.1, -0.65), u(0.75, -0.3), u(-0.05, 0.15)]));
+            p.add(Shape::line(vec![u(-0.7, -0.2), u(-0.7, 0.3), u(-0.05, 0.7), u(0.75, 0.25), u(0.75, -0.3)], s));
+            p.line_segment([u(-0.05, 0.15), u(-0.05, 0.7)], s);
+            p.circle_filled(u(-0.7, 0.3), 2.5, Color32::from_rgb(235, 87, 87));
+        }
+        "open" => {
+            p.add(Shape::line(vec![u(-0.8, 0.6), u(-0.8, -0.55), u(-0.35, -0.55), u(-0.2, -0.35), u(0.6, -0.35), u(0.6, -0.1)], s));
+            p.add(poly(vec![u(-0.8, 0.6), u(-0.5, -0.1), u(0.85, -0.1), u(0.55, 0.6)]));
+        }
+        "save" => {
+            p.rect_stroke(Rect::from_center_size(cx, vec2(w * 0.8, w * 0.8)), 3.0, s, egui::StrokeKind::Middle);
+            p.rect_filled(Rect::from_min_max(u(-0.25, -0.4), u(0.25, -0.1)), 1.0, c);
+            p.rect_stroke(Rect::from_min_max(u(-0.4, 0.1), u(0.4, 0.4)), 1.0, s, egui::StrokeKind::Middle);
+        }
+        "tooldb" => {
+            for (x, h) in [(-0.5f32, 0.55f32), (0.0, 0.75), (0.5, 0.6)] {
+                p.rect_stroke(Rect::from_min_max(u(x - 0.14, -0.75), u(x + 0.14, h - 0.2)), 1.0, s, egui::StrokeKind::Middle);
+                p.add(Shape::convex_polygon(vec![u(x - 0.14, h - 0.2), u(x + 0.14, h - 0.2), u(x, h + 0.05)], c, Stroke::NONE));
+            }
+        }
         "rect" => {
             p.rect_stroke(Rect::from_center_size(cx, vec2(w * 0.85, w * 0.6)), 2.0, s, egui::StrokeKind::Middle);
         }
@@ -335,6 +357,36 @@ pub fn tile(ui: &mut Ui, dark: bool, icon: &str, label: &str, selected: bool, ti
         let ir = Rect::from_center_size(rect.center() - vec2(0.0, 8.0), vec2(26.0, 22.0));
         draw(p, ir, col, icon);
         p.text(pos2(rect.center().x, rect.bottom() - 9.0), Align2::CENTER_CENTER, label, FontId::proportional(10.5), pal.weak);
+    }
+    resp.on_hover_text(tip)
+}
+
+/// A compact icon-only tile (the original's dense tool grids); the name shows on hover.
+pub fn icon_tile(ui: &mut Ui, dark: bool, icon: &str, selected: bool, tip: &str) -> Response {
+    let pal = theme::palette(dark);
+    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 38.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let enabled = ui.is_enabled();
+        let bg = if selected {
+            ACCENT.gamma_multiply(if dark { 0.35 } else { 0.22 })
+        } else if resp.hovered() {
+            pal.tile_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, CornerRadius::same(7), bg);
+        if selected {
+            p.rect_stroke(rect, CornerRadius::same(7), Stroke::new(1.5_f32, ACCENT), egui::StrokeKind::Inside);
+        }
+        let col = if selected {
+            if dark { Color32::WHITE } else { ACCENT }
+        } else if !enabled {
+            pal.weak.gamma_multiply(0.6)
+        } else {
+            pal.text
+        };
+        draw(p, Rect::from_center_size(rect.center(), vec2(24.0, 22.0)), col, icon);
     }
     resp.on_hover_text(tip)
 }

@@ -63,6 +63,8 @@ pub enum View {
 pub enum LeftTab {
     Design,
     Model,
+    Layers,
+    Components,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -217,6 +219,7 @@ pub struct App {
     pub show_sim: bool,
     pub sim_running: bool,
     pub sim_speed: f32,
+    pub show_tool_db: bool,
     pub sel_comp: Option<usize>,
     pub sel_tp: Option<usize>,
     pub dark: bool,
@@ -247,7 +250,7 @@ impl App {
             redo: Vec::new(),
             file: None,
             view: View::D3,
-            left_tab: LeftTab::Model,
+            left_tab: LeftTab::Design,
             tool: DrawTool::Select,
             sel: Vec::new(),
             form: None,
@@ -270,6 +273,7 @@ impl App {
             show_sim: false,
             sim_running: false,
             sim_speed: 3.2,
+            show_tool_db: false,
             sel_comp: Some(3),
             sel_tp: None,
             dark: true,
@@ -973,6 +977,11 @@ impl eframe::App for App {
             self.handle_screenshot(ctx);
             return;
         }
+        egui::SidePanel::left("lefttabs")
+            .exact_width(30.0)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(theme::palette(self.dark).canvas).inner_margin(egui::Margin::symmetric(3, 8)))
+            .show(ctx, |ui| self.left_tabs(ui));
         egui::SidePanel::left("left")
             .exact_width(304.0)
             .resizable(false)

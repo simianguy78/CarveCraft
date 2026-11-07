@@ -10,91 +10,94 @@ use crate::toolpath::{Material, Op, Side, Tool, ToolKind, Toolpath};
 use egui::{pos2, vec2, Color32, Rect, RichText, Ui};
 use std::sync::Arc;
 
+/// Pick a tool from the list and edit its size, feeds and speeds.
+fn tool_editor(ui: &mut Ui, pal: &theme::Palette, tools: &mut [Tool], idx: &mut usize) {
+    let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    egui::ComboBox::from_id_salt(ui.id().with("tool")).width(ui.available_width() - 8.0).selected_text(&names[*idx]).show_ui(ui, |ui| {
+        for (i, n) in names.iter().enumerate() {
+            ui.selectable_value(idx, i, n);
+        }
+    });
+    let t = &mut tools[*idx];
+    ui.label(RichText::new(format!("{} · tool #{}", t.kind.label(), t.number)).color(pal.weak));
+    egui::Grid::new(ui.id().with("toolgrid")).num_columns(4).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+        ui.label("Ø");
+        ui.add(egui::DragValue::new(&mut t.diameter).range(0.1..=50.0).speed(0.05).suffix(" mm"));
+        if t.kind == ToolKind::VBit {
+            ui.label("Angle");
+            ui.add(egui::DragValue::new(&mut t.angle).range(10.0..=150.0).suffix("°"));
+        } else {
+            ui.label("");
+            ui.label("");
+        }
+        ui.end_row();
+        ui.label("Step");
+        ui.add(egui::DragValue::new(&mut t.stepover).range(0.05..=50.0).speed(0.02).suffix(" mm"));
+        ui.label("Pass");
+        ui.add(egui::DragValue::new(&mut t.pass_depth).range(0.1..=50.0).speed(0.05).suffix(" mm"));
+        ui.end_row();
+        ui.label("Feed");
+        ui.add(egui::DragValue::new(&mut t.feed).range(10.0..=20000.0).speed(5.0));
+        ui.label("RPM");
+        ui.add(egui::DragValue::new(&mut t.rpm).range(1000.0..=40000.0).speed(50.0));
+        ui.end_row();
+        ui.label("Plunge");
+        ui.add(egui::DragValue::new(&mut t.plunge).range(10.0..=20000.0).speed(5.0));
+        ui.label("Flutes");
+        ui.add(egui::DragValue::new(&mut t.flutes).range(1..=8));
+        ui.end_row();
+    });
+    let chip = t.feed / (t.rpm.max(1.0) * t.flutes.max(1) as f32);
+    ui.label(RichText::new(format!("Chip load {chip:.3} mm per tooth")).small().color(pal.weak));
+}
+
 impl App {
     pub fn right_panel(&mut self, ui: &mut Ui) {
         let dark = self.dark;
-        let pal = theme::palette(dark);
         ui.label(RichText::new("Toolpaths").strong().size(16.0));
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            card(ui, dark, "Cutting tool", |ui| {
-                let names: Vec<String> = self.tools.iter().map(|t| t.name.clone()).collect();
-                egui::ComboBox::from_id_salt("tool").width(ui.available_width() - 8.0).selected_text(&names[self.tool_idx]).show_ui(ui, |ui| {
-                    for (i, n) in names.iter().enumerate() {
-                        ui.selectable_value(&mut self.tool_idx, i, n);
-                    }
-                });
-                let t = &mut self.tools[self.tool_idx];
-                ui.label(RichText::new(format!("{} · tool #{}", t.kind.label(), t.number)).color(pal.weak));
-                egui::Grid::new("toolgrid").num_columns(4).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
-                    ui.label("Ø");
-                    ui.add(egui::DragValue::new(&mut t.diameter).range(0.1..=50.0).speed(0.05).suffix(" mm"));
-                    if t.kind == ToolKind::VBit {
-                        ui.label("Angle");
-                        ui.add(egui::DragValue::new(&mut t.angle).range(10.0..=150.0).suffix("°"));
-                    } else {
-                        ui.label("");
-                        ui.label("");
-                    }
-                    ui.end_row();
-                    ui.label("Step");
-                    ui.add(egui::DragValue::new(&mut t.stepover).range(0.05..=50.0).speed(0.02).suffix(" mm"));
-                    ui.label("Pass");
-                    ui.add(egui::DragValue::new(&mut t.pass_depth).range(0.1..=50.0).speed(0.05).suffix(" mm"));
-                    ui.end_row();
-                    ui.label("Feed");
-                    ui.add(egui::DragValue::new(&mut t.feed).range(10.0..=20000.0).speed(5.0));
-                    ui.label("RPM");
-                    ui.add(egui::DragValue::new(&mut t.rpm).range(1000.0..=40000.0).speed(50.0));
-                    ui.end_row();
-                    ui.label("Plunge");
-                    ui.add(egui::DragValue::new(&mut t.plunge).range(10.0..=20000.0).speed(5.0));
-                    ui.label("Flutes");
-                    ui.add(egui::DragValue::new(&mut t.flutes).range(1..=8));
-                    ui.end_row();
-                });
-                let chip = t.feed / (t.rpm.max(1.0) * t.flutes.max(1) as f32);
-                ui.label(RichText::new(format!("Chip load {chip:.3} mm per tooth · tool #{}", t.number)).small().color(pal.weak));
-            });
+            self.material_setup(ui);
             let pending = self.pending_op.clone();
             let mut pick: Option<(Op, usize)> = None;
+            let mut toggle_tools = false;
+            let show_tools = self.show_tool_db;
             let is_on = |op: &Op| pending.as_ref().is_some_and(|p| std::mem::discriminant(p) == std::mem::discriminant(op));
-            card(ui, dark, "2D toolpaths", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                    let ops = [
-                        ("profile", "Profile", Op::Profile { depth: 6.0, side: Side::Outside }, 0usize, "Cut around or along vectors"),
-                        ("pocket", "Pocket", Op::Pocket { depth: 3.0, raster: true }, 0, "Clear out the inside of shapes"),
-                        ("drill", "Drill", Op::Drill { depth: 8.0 }, 0, "Drill holes at the centre of shapes"),
-                        ("vcarve", "V-Carve", Op::VCarve { flat_depth: 0.0 }, 4, "Carve sharp V-grooves – ideal for lettering"),
-                        ("engrave", "Engrave", Op::Engrave { depth: 1.0 }, 6, "Trace vectors at a fixed depth"),
-                        ("fluting", "Fluting", Op::Fluting { depth: 3.0 }, 2, "Grooves that ramp in and out"),
-                    ];
-                    for (icon, label, op, tool, tip) in ops {
-                        if icons::tile(ui, dark, icon, label, is_on(&op), tip).clicked() {
-                            pick = Some((op, tool));
-                        }
+            ui.label(RichText::new("Toolpath Operations").strong().size(13.5));
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                let ops = [
+                    ("profile", Op::Profile { depth: 6.0, side: Side::Outside }, 0usize, "Profile – cut around or along vectors"),
+                    ("pocket", Op::Pocket { depth: 3.0, raster: true }, 0, "Pocket – clear out the inside of shapes"),
+                    ("drill", Op::Drill { depth: 8.0 }, 0, "Drilling – holes at the centre of shapes"),
+                    ("vcarve", Op::VCarve { flat_depth: 0.0 }, 4, "V-Carve – sharp V-grooves, ideal for lettering"),
+                    ("engrave", Op::Engrave { depth: 1.0 }, 6, "Quick engrave – trace vectors at a fixed depth"),
+                    ("fluting", Op::Fluting { depth: 3.0 }, 2, "Fluting – grooves that ramp in and out"),
+                    ("rough3d", Op::Rough3D { allowance: 0.5 }, 0, "3D roughing – remove bulk material in steps"),
+                    ("finish3d", Op::Finish3D, 2, "3D finishing – follow the surface with a ball-nose"),
+                    ("texture_tp", Op::Texture { depth: 1.0, length: 12.0 }, 3, "Texture – hand-tooled strokes"),
+                ];
+                for (icon, op, tool, tip) in ops {
+                    if icons::icon_tile(ui, dark, icon, is_on(&op), tip).clicked() {
+                        pick = Some((op, tool));
                     }
-                });
+                }
+                if icons::icon_tile(ui, dark, "tooldb", show_tools, "Tool database – sizes, feeds and speeds").clicked() {
+                    toggle_tools = true;
+                }
             });
-            card(ui, dark, "3D toolpaths", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                    let ops = [
-                        ("rough3d", "Roughing", Op::Rough3D { allowance: 0.5 }, 0usize, "Remove bulk material in steps"),
-                        ("finish3d", "Finishing", Op::Finish3D, 2, "Follow the 3D surface with a ball-nose"),
-                        ("texture_tp", "Texture", Op::Texture { depth: 1.0, length: 12.0 }, 3, "Hand-tooled texture strokes"),
-                    ];
-                    for (icon, label, op, tool, tip) in ops {
-                        if icons::tile(ui, dark, icon, label, is_on(&op), tip).clicked() {
-                            pick = Some((op, tool));
-                        }
-                    }
-                });
-            });
+            ui.add_space(6.0);
             if let Some((op, tool)) = pick {
                 self.pending_op = Some(op);
                 self.tool_idx = tool;
+            }
+            if toggle_tools {
+                self.show_tool_db = !self.show_tool_db;
+            }
+            if self.show_tool_db && self.pending_op.is_none() {
+                let pal = theme::palette(dark);
+                card(ui, dark, "Tool database", |ui| tool_editor(ui, &pal, &mut self.tools, &mut self.tool_idx));
             }
             if self.pending_op.is_some() {
                 self.op_form(ui);
@@ -104,11 +107,52 @@ impl App {
         });
     }
 
+    /// The original's Material Setup strip: thickness, Z zero, XY datum and a Set button.
+    fn material_setup(&mut self, ui: &mut Ui) {
+        let dark = self.dark;
+        let pal = theme::palette(dark);
+        let m = self.doc.material.clone();
+        let mut set = false;
+        card(ui, dark, "Material Setup", |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(46.0, 40.0), egui::Sense::hover());
+                let p = ui.painter();
+                let wood = Color32::from_rgb(214, 170, 122);
+                let top = [r.left_top() + vec2(4.0, 12.0), r.left_top() + vec2(26.0, 4.0), r.right_top() + vec2(-2.0, 10.0), r.left_top() + vec2(22.0, 18.0)];
+                let drop = vec2(0.0, 14.0);
+                p.add(egui::Shape::convex_polygon(vec![top[0], top[3], top[3] + drop, top[0] + drop], wood.gamma_multiply(0.8), egui::Stroke::NONE));
+                p.add(egui::Shape::convex_polygon(vec![top[3], top[2], top[2] + drop, top[3] + drop], wood.gamma_multiply(0.6), egui::Stroke::NONE));
+                p.add(egui::Shape::convex_polygon(top.to_vec(), wood, egui::Stroke::NONE));
+                // The red outline marks where Z zero is: the top face or the bed.
+                let zero: Vec<_> = if m.z_bed { top.iter().map(|q| *q + drop).collect() } else { top.to_vec() };
+                p.add(egui::Shape::closed_line(zero, egui::Stroke::new(1.5_f32, Color32::from_rgb(235, 87, 87))));
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("Thickness {} mm", m.thickness)).strong());
+                    let z = if m.z_bed { "Z zero: machine bed" } else { "Z zero: material top" };
+                    ui.label(RichText::new(z).small().color(pal.weak));
+                    let datum = match m.origin {
+                        crate::toolpath::Origin::BottomLeft => "XY datum: bottom-left",
+                        crate::toolpath::Origin::Center => "XY datum: centre",
+                    };
+                    ui.label(RichText::new(format!("{datum} · safe Z {} mm", m.safe_z)).small().color(pal.weak));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Set…").clicked() {
+                        set = true;
+                    }
+                });
+            });
+        });
+        if set {
+            self.left_tab = crate::app::LeftTab::Design;
+            self.form = Some(crate::app::Form::Material);
+        }
+    }
+
     fn op_form(&mut self, ui: &mut Ui) {
         let dark = self.dark;
         let pal = theme::palette(dark);
         let nsel = self.sel.len();
-        let tool_name = self.tools[self.tool_idx].name.clone();
         let mut calc = false;
         let mut cancel = false;
         let Some(op) = &mut self.pending_op else { return };
@@ -150,7 +194,9 @@ impl App {
                     num(ui, "Stroke length", length, 1.0..=100.0, " mm");
                 }
             }
-            ui.label(RichText::new(format!("Tool: {tool_name}")).color(pal.weak));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Tool").strong());
+            tool_editor(ui, &pal, &mut self.tools, &mut self.tool_idx);
             if op.needs_vectors() {
                 let msg = if nsel == 0 { "Select vectors in the 2D view first".to_string() } else { format!("{nsel} vector(s) selected") };
                 ui.label(RichText::new(msg).color(if nsel == 0 { Color32::from_rgb(240, 160, 60) } else { pal.weak }));
@@ -180,9 +226,25 @@ impl App {
         let mut action: Option<(&str, usize)> = None;
         let mut vis_changed = false;
         let mut sel_tp = self.sel_tp;
-        card(ui, dark, "Toolpath list", |ui| {
+        let n = self.doc.toolpaths.len();
+        card(ui, dark, "Toolpaths", |ui| {
+            if n > 1 {
+                if let Some(i) = sel_tp.filter(|i| *i < n) {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Order").small().color(pal.weak));
+                        if ui.add_enabled(i > 0, egui::Button::new("▲").small()).on_hover_text("Cut earlier").clicked() {
+                            action = Some(("up", i));
+                        }
+                        if ui.add_enabled(i + 1 < n, egui::Button::new("▼").small()).on_hover_text("Cut later").clicked() {
+                            action = Some(("down", i));
+                        }
+                    });
+                }
+            }
             if self.doc.toolpaths.is_empty() {
-                ui.label(RichText::new("No toolpaths yet.").color(pal.weak));
+                ui.add_space(18.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("No Toolpaths Created Yet").size(16.0).color(pal.weak)));
+                ui.add_space(18.0);
             }
             for (i, t) in self.doc.toolpaths.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -225,6 +287,13 @@ impl App {
                     self.push_undo();
                     let (m, mat) = (&self.doc.model, &self.doc.material);
                     self.doc.toolpaths[i].calculate(m, mat);
+                    self.invalidate_sim();
+                }
+                "up" | "down" => {
+                    let j = if a == "up" { i - 1 } else { i + 1 };
+                    self.push_undo();
+                    self.doc.toolpaths.swap(i, j);
+                    self.sel_tp = Some(j);
                     self.invalidate_sim();
                 }
                 "save" => self.export_gcode(Some(i)),

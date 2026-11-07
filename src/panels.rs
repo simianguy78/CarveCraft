@@ -7,7 +7,7 @@ use crate::model::{Brush, Combine, Profile, ReliefKind, TextureKind};
 use crate::render3d::Camera;
 use crate::theme::{self, ACCENT};
 use crate::toolpath::Origin;
-use egui::{pos2, vec2, Color32, CornerRadius, RichText, Ui};
+use egui::{pos2, vec2, Color32, CornerRadius, FontId, RichText, Ui};
 
 pub fn card(ui: &mut Ui, dark: bool, title: &str, add: impl FnOnce(&mut Ui)) {
     let pal = theme::palette(dark);
@@ -78,6 +78,18 @@ pub fn numu(ui: &mut Ui, label: &str, v: &mut u32, range: std::ops::RangeInclusi
 
 pub fn primary(ui: &mut Ui, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).color(Color32::WHITE).strong()).fill(ACCENT).min_size(vec2(110.0, 28.0)))
+}
+
+/// A titled group of compact icon tiles, laid out like the original's Design panel.
+fn section(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(title).strong().size(13.5));
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        add(ui);
+    });
+    ui.add_space(4.0);
 }
 
 fn tiles(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
@@ -341,7 +353,7 @@ impl App {
         egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.allocate_ui(vec2(220.0, 32.0), |ui| {
-                    segmented(ui, self.dark, &mut self.view, &[(View::D2, "2D Design"), (View::D3, "3D View")]);
+                    segmented(ui, self.dark, &mut self.view, &[(View::D2, "2D View"), (View::D3, "3D View")]);
                 });
                 ui.add_space(8.0);
                 match self.view {
@@ -353,6 +365,16 @@ impl App {
                         ui.toggle_value(&mut self.snap, "Snap");
                         ui.toggle_value(&mut self.show_model2d, "Model");
                         ui.toggle_value(&mut self.show_paths, "Toolpaths");
+                        // Active layer picker, like the original's Layer drop-down.
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Layer").color(pal.weak));
+                        let names: Vec<String> = self.doc.layers.iter().map(|l| l.name.clone()).collect();
+                        let cur = self.active_layer.min(names.len().saturating_sub(1));
+                        egui::ComboBox::from_id_salt("layerpick").width(90.0).selected_text(names.get(cur).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut self.active_layer, i, n);
+                            }
+                        });
                     }
                     View::D3 => {
                         if ui.button("Iso").clicked() {
@@ -385,18 +407,51 @@ impl App {
         });
     }
 
-    pub fn left_panel(&mut self, ui: &mut Ui) {
-        let dark = self.dark;
-        let mut tab = self.left_tab;
-        segmented(ui, dark, &mut tab, &[(LeftTab::Design, "Design"), (LeftTab::Model, "3D Model")]);
-        if tab != self.left_tab {
-            self.left_tab = tab;
-            self.form = None;
-            if self.tool == DrawTool::Sculpt {
-                self.tool = DrawTool::Select;
+    /// The original's vertical tab strip down the left edge, as rounded pills.
+    pub fn left_tabs(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(self.dark);
+        let tabs = [(LeftTab::Design, "Design"), (LeftTab::Model, "Modeling"), (LeftTab::Layers, "Layers"), (LeftTab::Components, "Components")];
+        let mut pick = None;
+        for (tab, label) in tabs {
+            let on = self.left_tab == tab;
+            let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(12.5), if on { Color32::WHITE } else { pal.weak });
+            let (rect, resp) = ui.allocate_exact_size(vec2(24.0, galley.size().x + 22.0), egui::Sense::click());
+            let fill = if on {
+                ACCENT
+            } else if resp.hovered() {
+                pal.tile_hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
+            // Rotated a quarter turn so it reads bottom-to-top, like the original's tabs.
+            let pos = pos2(rect.center().x - galley.size().y * 0.5, rect.bottom() - 11.0);
+            ui.painter().add(egui::epaint::TextShape::new(pos, galley, pal.text).with_angle(-std::f32::consts::FRAC_PI_2));
+            if resp.clicked() {
+                pick = Some(tab);
+            }
+            ui.add_space(4.0);
+        }
+        if let Some(tab) = pick {
+            if tab != self.left_tab {
+                self.left_tab = tab;
+                self.form = None;
+                if self.tool == DrawTool::Sculpt {
+                    self.tool = DrawTool::Select;
+                }
             }
         }
-        ui.add_space(8.0);
+    }
+
+    pub fn left_panel(&mut self, ui: &mut Ui) {
+        let title = match self.left_tab {
+            LeftTab::Design => "Design",
+            LeftTab::Model => "Modeling",
+            LeftTab::Layers => "Layers",
+            LeftTab::Components => "Components",
+        };
+        ui.label(RichText::new(title).strong().size(16.0));
+        ui.add_space(4.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if let Some(f) = self.form {
                 self.form_card(ui, f);
@@ -404,6 +459,8 @@ impl App {
             match self.left_tab {
                 LeftTab::Design => self.design_tab(ui),
                 LeftTab::Model => self.model_tab(ui),
+                LeftTab::Layers => self.layers_card(ui),
+                LeftTab::Components => self.components_card(ui),
             }
         });
     }
@@ -569,102 +626,136 @@ impl App {
         }
     }
 
+    fn open_3d_form(&mut self, form: Form, prof: Option<Profile>) {
+        self.form = Some(form);
+        if let Some(pr) = prof {
+            self.p.profile = pr;
+            self.p.limit = true;
+            self.p.height = 3.0;
+        } else if form == Form::Shape && self.p.profile == Profile::Angle {
+            self.p.profile = Profile::Round;
+        }
+    }
+
     fn design_tab(&mut self, ui: &mut Ui) {
         let dark = self.dark;
-        let m = self.doc.material.clone();
-        let mut edit_job = false;
-        card(ui, dark, "Job", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} × {} mm", m.w, m.h)).strong());
-                ui.label(format!("· {} mm thick", m.thickness));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Edit").clicked() {
-                        edit_job = true;
-                    }
-                });
-            });
-        });
-        if edit_job {
-            self.form = Some(Form::Material);
-        }
-        card(ui, dark, "Draw", |ui| {
-            let tools = [
-                (DrawTool::Select, "select", "Select", "Select and move vectors"),
-                (DrawTool::Rect, "rect", "Rectangle", "Drag to draw a rectangle"),
-                (DrawTool::Circle, "circle", "Circle", "Drag from the centre"),
-                (DrawTool::Ellipse, "ellipse", "Ellipse", "Drag a box"),
-                (DrawTool::Polygon, "polygon", "Polygon", "Drag from the centre"),
-                (DrawTool::Star, "star", "Star", "Drag from the centre"),
-                (DrawTool::Polyline, "polyline", "Polyline", "Click points; double-click or Enter to finish, click the first point to close"),
-                (DrawTool::Arc, "arc", "Arc", "Click start, end, then a point on the arc"),
-                (DrawTool::Freehand, "freehand", "Freehand", "Drag to sketch a curve"),
-                (DrawTool::Text, "text", "Text", "Click to place text"),
-                (DrawTool::Node, "node", "Node edit", "Drag a shape's points; double-click to add or delete"),
-                (DrawTool::Trim, "trim", "Trim", "Click a piece of a vector to cut it back to the lines crossing it"),
-                (DrawTool::Fillet, "fillet", "Fillet", "Click a corner to round it"),
-            ];
-            tiles(ui, |ui| {
-                for (t, icon, label, tip) in tools {
-                    if icons::tile(ui, dark, icon, label, self.tool == t, tip).clicked() {
-                        self.tool = t;
-                        self.poly_pts.clear();
-                        if t != DrawTool::Select {
-                            self.view = View::D2;
-                        }
-                    }
+        let pal = theme::palette(dark);
+        let has_sel = !self.sel.is_empty();
+        let mut cmd: Option<&'static str> = None;
+        let mut pick_tool: Option<DrawTool> = None;
+        let mut open3d: Option<(Form, Option<Profile>)> = None;
+        let tool_now = self.tool;
+        let (form_now, prof_now) = (self.form, self.p.profile);
+
+        section(ui, "File Operations", |ui| {
+            for (id, icon, tip) in [
+                ("job", "job", "Job setup – material size, thickness and origin"),
+                ("open", "open", "Open a saved job"),
+                ("save", "save", "Save the job"),
+                ("heightmap", "import", "Import a picture as a 3D height map"),
+            ] {
+                if icons::icon_tile(ui, dark, icon, form_now == Some(Form::Material) && id == "job", tip).clicked() {
+                    cmd = Some(id);
                 }
-            });
-            match self.tool {
-                DrawTool::Rect => {
-                    num(ui, "Corner radius", &mut self.p.rect_r, 0.0..=500.0, " mm");
-                }
-                DrawTool::Polygon => {
-                    numu(ui, "Sides", &mut self.p.sides, 3..=64);
-                }
-                DrawTool::Star => {
-                    numu(ui, "Points", &mut self.p.star_points, 3..=64);
-                    num(ui, "Inner ratio", &mut self.p.star_ratio, 0.05..=0.95, "");
-                }
-                DrawTool::Text => {
-                    ui.add(egui::TextEdit::singleline(&mut self.p.text).hint_text("Text"));
-                    num(ui, "Letter height", &mut self.p.text_size, 2.0..=500.0, " mm");
-                }
-                DrawTool::Fillet => {
-                    num(ui, "Radius", &mut self.p.fillet_r, 0.1..=500.0, " mm");
-                    if ui.add_enabled(!self.sel.is_empty(), egui::Button::new("Round all corners of selection")).clicked() {
-                        self.apply_fillet_all();
-                    }
-                }
-                _ => {}
             }
         });
-        let has_sel = !self.sel.is_empty();
-        let (mw, mh) = (self.doc.material.w, self.doc.material.h);
-        let mut cmd: Option<&str> = None;
-        card(ui, dark, "Edit", |ui| {
-            tiles(ui, |ui| {
-                ui.add_enabled_ui(has_sel, |ui| {
-                    let items = [
-                        ("duplicate", "Duplicate", "Copy the selection (Ctrl+D)"),
-                        ("delete", "Delete", "Delete the selection (Del)"),
-                        ("mirror_h", "Mirror H", "Flip left-right"),
-                        ("mirror_v", "Mirror V", "Flip top-bottom"),
-                        ("rotate", "Rotate 90°", "Rotate the selection by 90°"),
-                        ("center", "Centre", "Move the selection to the middle of the job"),
-                        ("offset", "Offset", "Make a bigger or smaller copy of the outline"),
-                        ("weld", "Weld", "Join overlapping closed shapes into one outline"),
-                        ("circ_array", "Circular", "Copy around the job centre"),
-                        ("grid_array", "Grid", "Copy in rows and columns"),
-                    ];
-                    for (icon, label, tip) in items {
-                        if icons::tile(ui, dark, icon, label, false, tip).clicked() {
-                            cmd = Some(icon);
-                        }
+        section(ui, "Create Vectors", |ui| {
+            for (t, icon, tip) in [
+                (DrawTool::Circle, "circle", "Circle – drag from the centre"),
+                (DrawTool::Ellipse, "ellipse", "Ellipse – drag a box"),
+                (DrawTool::Rect, "rect", "Rectangle – drag a box"),
+                (DrawTool::Polygon, "polygon", "Polygon – drag from the centre"),
+                (DrawTool::Star, "star", "Star – drag from the centre"),
+                (DrawTool::Polyline, "polyline", "Polyline – click points; double-click or Enter to finish"),
+                (DrawTool::Arc, "arc", "Arc – click start, end, then a point on the arc"),
+                (DrawTool::Freehand, "freehand", "Freehand – drag to sketch a curve"),
+                (DrawTool::Text, "text", "Text – click to place"),
+            ] {
+                if icons::icon_tile(ui, dark, icon, tool_now == t, tip).clicked() {
+                    pick_tool = Some(t);
+                }
+            }
+        });
+        section(ui, "Transform Objects", |ui| {
+            ui.add_enabled_ui(has_sel, |ui| {
+                for (id, tip) in [
+                    ("duplicate", "Duplicate the selection (Ctrl+D)"),
+                    ("mirror_h", "Mirror left-right"),
+                    ("mirror_v", "Mirror top-bottom"),
+                    ("rotate", "Rotate the selection by 90°"),
+                    ("center", "Move the selection to the middle of the job"),
+                ] {
+                    if icons::icon_tile(ui, dark, id, false, tip).clicked() {
+                        cmd = Some(id);
                     }
-                });
+                }
             });
         });
+        section(ui, "Edit Objects", |ui| {
+            for (t, icon, tip) in [
+                (DrawTool::Select, "select", "Select and move vectors"),
+                (DrawTool::Node, "node", "Node edit – drag points; double-click to add or delete"),
+                (DrawTool::Trim, "trim", "Trim – click a piece of a vector to cut it back"),
+                (DrawTool::Fillet, "fillet", "Fillet – click a corner to round it"),
+            ] {
+                if icons::icon_tile(ui, dark, icon, tool_now == t, tip).clicked() {
+                    pick_tool = Some(t);
+                }
+            }
+            ui.add_enabled_ui(has_sel, |ui| {
+                for (id, tip) in [("weld", "Weld overlapping closed shapes into one outline"), ("delete", "Delete the selection (Del)")] {
+                    if icons::icon_tile(ui, dark, id, false, tip).clicked() {
+                        cmd = Some(id);
+                    }
+                }
+            });
+        });
+        section(ui, "Offset and Layout", |ui| {
+            ui.add_enabled_ui(has_sel, |ui| {
+                for (id, tip) in [
+                    ("offset", "Offset – a bigger or smaller copy of the outline"),
+                    ("circ_array", "Circular array – copies around the job centre"),
+                    ("grid_array", "Grid array – copies in rows and columns"),
+                ] {
+                    let on = matches!((id, form_now), ("offset", Some(Form::Offset)) | ("circ_array", Some(Form::CircularArray)) | ("grid_array", Some(Form::GridArray)));
+                    if icons::icon_tile(ui, dark, id, on, tip).clicked() {
+                        cmd = Some(id);
+                    }
+                }
+            });
+        });
+        section(ui, "3D Model Tools", |ui| {
+            for (icon, tip, form, prof) in [
+                ("shape", "Create shape – dome, flat or angled, from closed vectors", Form::Shape, None),
+                ("prism", "Prism – sharp ridges, great for lettering", Form::Shape, Some(Profile::Angle)),
+                ("extrude", "Extrude a profile along a curve", Form::Extrude, None),
+                ("two_rail", "Two-rail sweep between two curves", Form::TwoRail, None),
+                ("texture", "Texture an area", Form::Texture, None),
+                ("relief", "Relief library", Form::Relief, None),
+            ] {
+                let on = form_now == Some(form) && (form != Form::Shape || (prof == Some(Profile::Angle)) == (prof_now == Profile::Angle));
+                if icons::icon_tile(ui, dark, icon, on, tip).clicked() {
+                    open3d = Some((form, prof));
+                }
+            }
+        });
+
+        if let Some(t) = pick_tool {
+            self.tool = t;
+            self.poly_pts.clear();
+            if t != DrawTool::Select {
+                self.view = View::D2;
+            }
+        }
+        if let Some((f, pr)) = open3d {
+            self.open_3d_form(f, pr);
+        }
+        let (mw, mh) = (self.doc.material.w, self.doc.material.h);
         match cmd {
+            Some("job") => self.form = Some(Form::Material),
+            Some("open") => self.open_dialog(),
+            Some("save") => self.save(false),
+            Some("heightmap") => self.form = Some(Form::ImportHeight),
             Some("duplicate") => self.duplicate_selected(vec2(10.0, -10.0)),
             Some("delete") => self.delete_selected(),
             Some("mirror_h") => self.transform_selected(|v, c| {
@@ -691,8 +782,62 @@ impl App {
             Some("grid_array") => self.form = Some(Form::GridArray),
             _ => {}
         }
+
+        // Options for the active drawing tool, like the original's tool form.
+        let title = match self.tool {
+            DrawTool::Rect => Some("Rectangle"),
+            DrawTool::Polygon => Some("Polygon"),
+            DrawTool::Star => Some("Star"),
+            DrawTool::Text => Some("Text"),
+            DrawTool::Fillet => Some("Fillet"),
+            _ => None,
+        };
+        if let Some(title) = title {
+            ui.add_space(4.0);
+            let tool = self.tool;
+            card(ui, dark, title, |ui| match tool {
+                DrawTool::Rect => {
+                    num(ui, "Corner radius", &mut self.p.rect_r, 0.0..=500.0, " mm");
+                }
+                DrawTool::Polygon => {
+                    numu(ui, "Sides", &mut self.p.sides, 3..=64);
+                }
+                DrawTool::Star => {
+                    numu(ui, "Points", &mut self.p.star_points, 3..=64);
+                    num(ui, "Inner ratio", &mut self.p.star_ratio, 0.05..=0.95, "");
+                }
+                DrawTool::Text => {
+                    ui.add(egui::TextEdit::singleline(&mut self.p.text).hint_text("Text"));
+                    num(ui, "Letter height", &mut self.p.text_size, 2.0..=500.0, " mm");
+                }
+                _ => {
+                    num(ui, "Radius", &mut self.p.fillet_r, 0.1..=500.0, " mm");
+                }
+            });
+            if tool == DrawTool::Fillet && has_sel && ui.button("Round all corners of selection").clicked() {
+                self.apply_fillet_all();
+            }
+        }
         self.properties_card(ui);
-        self.layers_card(ui);
+
+        let m = self.doc.material.clone();
+        let mut edit_job = false;
+        ui.add_space(6.0);
+        card(ui, dark, "Job Dimensions", |ui| {
+            egui::Grid::new("jobdims").num_columns(2).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
+                for (k, v) in [("Width (X)", m.w), ("Height (Y)", m.h), ("Depth (Z)", m.thickness)] {
+                    ui.label(RichText::new(k).color(pal.weak));
+                    ui.label(RichText::new(format!("{v} mm")).strong());
+                    ui.end_row();
+                }
+            });
+            if ui.button("Edit job…").clicked() {
+                edit_job = true;
+            }
+        });
+        if edit_job {
+            self.form = Some(Form::Material);
+        }
     }
 
     fn properties_card(&mut self, ui: &mut Ui) {
@@ -902,7 +1047,6 @@ impl App {
             Some("stl") => self.export_stl(),
             _ => {}
         }
-        self.components_card(ui);
     }
 
     fn components_card(&mut self, ui: &mut Ui) {
