@@ -1,11 +1,44 @@
 //! The 2D design canvas and the 3D view.
 
-use crate::app::{App, Drag, DrawTool};
-use crate::geom::{self, ShapeKind};
+use crate::app::{App, Drag, DrawTool, Handle};
+use crate::geom::{self, ShapeKind, Vector};
 use crate::render3d::{self, Projector, Surface};
 use crate::theme::{self, ACCENT};
 use crate::toolpath::ToolKind;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Mesh, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui};
+
+/// Scale a shape by `sx`/`sy` along the job axes about `anchor`.
+fn scale_vector(v0: &Vector, anchor: Pos2, sx: f32, sy: f32) -> Vector {
+    let mut v = v0.clone();
+    v.center = pos2(anchor.x + (v0.center.x - anchor.x) * sx, anchor.y + (v0.center.y - anchor.y) * sy);
+    let a = v0.angle.rem_euclid(180.0);
+    let near = |t: f32| (a - t).abs() < 0.01 || (a - t - 180.0).abs() < 0.01;
+    if (sx - sy).abs() < 1e-5 || near(0.0) {
+        v.scale.x *= sx;
+        v.scale.y *= sy;
+    } else if near(90.0) {
+        // Turned a quarter: the shape's own axes are swapped relative to the job.
+        v.scale.x *= sy;
+        v.scale.y *= sx;
+    } else {
+        // Stretching a turned shape skews it, which only a free curve can hold.
+        let polys = v0.polys();
+        if polys.len() == 1 {
+            let pts: Vec<Pos2> = polys[0].pts.iter().map(|p| pos2(anchor.x + (p.x - anchor.x) * sx, anchor.y + (p.y - anchor.y) * sy)).collect();
+            let c = geom::bounds_of(&[geom::Poly { pts: pts.clone(), closed: polys[0].closed }]).center();
+            v.kind = ShapeKind::Path { pts: pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect(), closed: polys[0].closed };
+            v.center = c;
+            v.angle = 0.0;
+            v.scale = vec2(1.0, 1.0);
+        } else {
+            // Text and other multi-outline shapes keep their form: scale evenly.
+            let s = (sx * sy).sqrt();
+            v.center = pos2(anchor.x + (v0.center.x - anchor.x) * s, anchor.y + (v0.center.y - anchor.y) * s);
+            v.scale *= s;
+        }
+    }
+    v
+}
 
 fn path_color(kind: ToolKind, i: usize) -> Color32 {
     let base = match kind {
@@ -175,14 +208,45 @@ impl App {
                 }
             }
         }
-        if let Some(b) = self.selection_bounds() {
+        if let Some((b, handles)) = self.selection_handles() {
             let sr = Rect::from_two_pos(to_s(b.min), to_s(b.max)).expand(5.0);
             let dash = Shape::dashed_line(&[sr.left_top(), sr.right_top(), sr.right_bottom(), sr.left_bottom(), sr.left_top()], Stroke::new(1.0_f32, ACCENT), 5.0, 4.0);
             painter.extend(dash);
-            for p in [sr.left_top(), sr.right_top(), sr.right_bottom(), sr.left_bottom(), sr.center()] {
-                painter.rect_filled(Rect::from_center_size(p, vec2(7.0, 7.0)), CornerRadius::same(2), ACCENT);
+            let hover = if self.tool == DrawTool::Select { hover_j.and_then(|p| self.handle_at(p)) } else { None };
+            let active = match &self.drag {
+                Drag::Scale { hx, hy, .. } => Some(crate::app::Handle::Scale(*hx, *hy)),
+                Drag::Rotate { .. } => Some(crate::app::Handle::Rotate),
+                _ => None,
+            };
+            let show_handles = self.tool == DrawTool::Select;
+            for (h, q) in handles.iter().filter(|_| show_handles) {
+                let s = to_s(*q);
+                let hot = hover == Some(*h) && active.is_none() || active == Some(*h);
+                match h {
+                    crate::app::Handle::Scale(..) => {
+                        let r = Rect::from_center_size(s, vec2(9.0, 9.0) * if hot { 1.25 } else { 1.0 });
+                        painter.rect_filled(r, CornerRadius::same(2), if hot { ACCENT } else { pal.sheet });
+                        painter.rect_stroke(r, CornerRadius::same(2), Stroke::new(1.5_f32, ACCENT), egui::StrokeKind::Middle);
+                    }
+                    crate::app::Handle::Rotate => {
+                        // A small curved arrow tells it rotates.
+                        let rr = if hot { 7.0 } else { 5.5 };
+                        painter.circle_filled(s, rr, if hot { ACCENT } else { pal.sheet });
+                        painter.circle_stroke(s, rr, Stroke::new(1.5_f32, ACCENT));
+                        let arc: Vec<Pos2> = (0..=8).map(|k| {
+                            let a = 0.6 + k as f32 / 8.0 * 4.0;
+                            s + vec2(a.cos(), a.sin()) * (rr * 0.5)
+                        }).collect();
+                        painter.add(Shape::line(arc, Stroke::new(1.2_f32, if hot { Color32::WHITE } else { ACCENT })));
+                    }
+                }
             }
-            painter.text(sr.center_top() - vec2(0.0, 4.0), Align2::CENTER_BOTTOM, format!("{:.1} × {:.1}", b.width(), b.height()), FontId::proportional(11.0), ACCENT);
+            painter.circle_filled(sr.center(), 2.5, ACCENT);
+            let label = match &self.drag {
+                Drag::Rotate { angle, .. } => format!("{angle:.1}°"),
+                _ => format!("{:.1} × {:.1}", b.width(), b.height()),
+            };
+            painter.text(sr.center_top() - vec2(0.0, 10.0), Align2::CENTER_BOTTOM, label, FontId::proportional(11.0), ACCENT);
         }
 
         // in-progress previews
@@ -305,7 +369,7 @@ impl App {
 
         // hint
         let hint = match self.tool {
-            DrawTool::Select => "Click or drag a box to select · drag a selection to move it · right-drag to pan · wheel to zoom",
+            DrawTool::Select => "Click or box-select · drag to move · corner squares scale (Shift = free), edge squares stretch · round dots rotate (Shift = 15°)",
             DrawTool::Rect | DrawTool::Ellipse => "Drag to draw · Esc returns to Select",
             DrawTool::Circle | DrawTool::Polygon | DrawTool::Star => "Drag out from the centre · Esc returns to Select",
             DrawTool::Polyline => "Click to add points · click the first point to close · double-click or Enter to finish",
@@ -319,6 +383,72 @@ impl App {
         };
         let hr = Rect::from_min_size(rect.left_bottom() + vec2(12.0, -34.0), vec2(rect.width() - 24.0, 24.0));
         painter.text(hr.left_center(), Align2::LEFT_CENTER, hint, FontId::proportional(12.0), pal.weak);
+    }
+
+    /// Apply a scale or rotate handle drag, starting from the shapes as they were when it began.
+    fn drag_handle(&mut self, p: Pos2, free: bool) {
+        match &mut self.drag {
+            Drag::Scale { orig, bounds: b, hx, hy } => {
+                let (hx, hy) = (*hx, *hy);
+                let side = |h: i8, lo: f32, mid: f32, hi: f32| match h {
+                    1 => (lo, hi),
+                    -1 => (hi, lo),
+                    _ => (mid, mid),
+                };
+                let (ax, hxp) = side(hx, b.min.x, b.center().x, b.max.x);
+                let (ay, hyp) = side(hy, b.min.y, b.center().y, b.max.y);
+                let ratio = |cur: f32, anchor: f32, handle: f32| {
+                    let span = handle - anchor;
+                    if span.abs() < 1e-6 {
+                        1.0
+                    } else {
+                        ((cur - anchor) / span).max(0.01)
+                    }
+                };
+                let mut sx = if hx != 0 { ratio(p.x, ax, hxp) } else { 1.0 };
+                let mut sy = if hy != 0 { ratio(p.y, ay, hyp) } else { 1.0 };
+                if hx != 0 && hy != 0 && !free {
+                    // Corners keep proportions unless Shift is held.
+                    let s = if (sx - 1.0).abs() > (sy - 1.0).abs() { sx } else { sy };
+                    sx = s;
+                    sy = s;
+                }
+                let anchor = pos2(ax, ay);
+                let scaled: Vec<Vector> = orig.iter().map(|v0| scale_vector(v0, anchor, sx, sy)).collect();
+                for nv in scaled {
+                    if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == nv.id) {
+                        *v = nv;
+                    }
+                }
+                self.status = format!("Scale {:.0}% × {:.0}%", sx * 100.0, sy * 100.0);
+            }
+            Drag::Rotate { orig, center, a0, angle } => {
+                let c = *center;
+                let mut da = ((p.y - c.y).atan2(p.x - c.x) - *a0).to_degrees();
+                if free {
+                    da = (da / 15.0).round() * 15.0;
+                }
+                *angle = da;
+                let (s, co) = da.to_radians().sin_cos();
+                let rotated: Vec<Vector> = orig
+                    .iter()
+                    .map(|v0| {
+                        let mut v = v0.clone();
+                        let d = v0.center - c;
+                        v.center = c + vec2(d.x * co - d.y * s, d.x * s + d.y * co);
+                        v.angle = v0.angle + da;
+                        v
+                    })
+                    .collect();
+                for nv in rotated {
+                    if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == nv.id) {
+                        *v = nv;
+                    }
+                }
+                self.status = format!("Rotate {da:.1}°  (Shift snaps to 15°)");
+            }
+            _ => {}
+        }
     }
 
     fn shape_from_drag(&self, a: Pos2, b: Pos2) -> Option<(ShapeKind, Pos2)> {
@@ -337,11 +467,77 @@ impl App {
         })
     }
 
+    /// Where the selection handles are, in job units: scale squares on the corners and edge
+    /// middles of the (slightly padded) selection box, rotate dots just outside each corner.
+    pub fn selection_handles(&self) -> Option<(Rect, Vec<(Handle, Pos2)>)> {
+        let b = self.selection_bounds()?;
+        let z = self.v2_zoom.max(1e-3);
+        let r = b.expand(5.0 / z);
+        let mut out = Vec::new();
+        for hy in [-1i8, 0, 1] {
+            for hx in [-1i8, 0, 1] {
+                if hx == 0 && hy == 0 {
+                    continue;
+                }
+                let x = [r.min.x, r.center().x, r.max.x][(hx + 1) as usize];
+                let y = [r.min.y, r.center().y, r.max.y][(hy + 1) as usize];
+                out.push((Handle::Scale(hx, hy), pos2(x, y)));
+                if hx != 0 && hy != 0 {
+                    let off = 15.0 / z;
+                    out.push((Handle::Rotate, pos2(x + hx as f32 * off, y + hy as f32 * off)));
+                }
+            }
+        }
+        Some((b, out))
+    }
+
+    fn handle_at(&self, p: Pos2) -> Option<Handle> {
+        let (_, hs) = self.selection_handles()?;
+        let reach = 7.0 / self.v2_zoom.max(1e-3);
+        hs.into_iter().filter(|(_, q)| (*q - p).length() <= reach).min_by(|a, b| (a.1 - p).length().total_cmp(&(b.1 - p).length())).map(|(h, _)| h)
+    }
+
     fn handle_2d_input(&mut self, resp: &egui::Response, to_j: impl Fn(Pos2) -> Pos2, tol: f32) {
         let shift = resp.ctx.input(|i| i.modifiers.shift || i.modifiers.command);
         let pos = resp.interact_pointer_pos().map(&to_j);
         match self.tool {
             DrawTool::Select => {
+                // Cursor feedback over the handles.
+                if let Some(h) = resp.hover_pos().map(&to_j).and_then(|p| self.handle_at(p)) {
+                    let icon = match h {
+                        Handle::Rotate => egui::CursorIcon::Alias,
+                        Handle::Scale(0, _) => egui::CursorIcon::ResizeVertical,
+                        Handle::Scale(_, 0) => egui::CursorIcon::ResizeHorizontal,
+                        Handle::Scale(hx, hy) if hx == hy => egui::CursorIcon::ResizeNeSw,
+                        Handle::Scale(..) => egui::CursorIcon::ResizeNwSe,
+                    };
+                    resp.ctx.set_cursor_icon(icon);
+                }
+                if resp.drag_started_by(PointerButton::Primary) {
+                    let start = to_j(resp.ctx.input(|i| i.pointer.press_origin()).unwrap_or(resp.rect.center()));
+                    if let (Some(h), Some((b, _))) = (self.handle_at(start), self.selection_handles()) {
+                        self.push_undo();
+                        let orig: Vec<Vector> = self.selected_vectors().into_iter().cloned().collect();
+                        self.drag = match h {
+                            Handle::Scale(hx, hy) => Drag::Scale { orig, bounds: b, hx, hy },
+                            Handle::Rotate => {
+                                let c = b.center();
+                                Drag::Rotate { orig, center: c, a0: (start.y - c.y).atan2(start.x - c.x), angle: 0.0 }
+                            }
+                        };
+                    }
+                }
+                if resp.dragged_by(PointerButton::Primary) {
+                    if let Some(p) = pos {
+                        self.drag_handle(p, shift);
+                    }
+                }
+                if matches!(self.drag, Drag::Scale { .. } | Drag::Rotate { .. }) {
+                    if resp.drag_stopped_by(PointerButton::Primary) {
+                        self.drag = Drag::None;
+                    }
+                    return;
+                }
                 if resp.drag_started_by(PointerButton::Primary) {
                     if let Some(p) = pos {
                         let start = to_j(resp.ctx.input(|i| i.pointer.press_origin()).unwrap_or(resp.rect.center()));
@@ -768,5 +964,46 @@ impl App {
             format!("Model height {:.1} mm · {} components · drag to orbit, right-drag to pan, wheel to zoom", (m.max_height() - m.min_height()).max(0.0), m.components.len())
         };
         painter.text(rect.right_bottom() + vec2(-14.0, -14.0), Align2::RIGHT_BOTTOM, info, FontId::proportional(12.0), pal.weak);
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    fn rect(angle: f32) -> Vector {
+        let mut v = Vector::new(1, ShapeKind::Rect { w: 40.0, h: 20.0, r: 0.0 }, pos2(100.0, 50.0), 0);
+        v.angle = angle;
+        v
+    }
+
+    #[test]
+    fn corner_scale_keeps_opposite_corner_fixed() {
+        let v = rect(0.0);
+        let b = v.bounds();
+        let s = scale_vector(&v, b.min, 2.0, 1.5);
+        let nb = s.bounds();
+        assert!((nb.min - b.min).length() < 1e-3);
+        assert!((nb.width() - 80.0).abs() < 1e-3 && (nb.height() - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn quarter_turned_shape_stretches_along_job_axes() {
+        let v = rect(90.0);
+        let b = v.bounds();
+        let s = scale_vector(&v, b.center(), 2.0, 1.0);
+        let nb = s.bounds();
+        assert!((nb.width() - b.width() * 2.0).abs() < 1e-2, "{:?} vs {:?}", nb, b);
+        assert!((nb.height() - b.height()).abs() < 1e-2);
+    }
+
+    #[test]
+    fn skewed_shape_becomes_curve_with_right_size() {
+        let v = rect(30.0);
+        let b = v.bounds();
+        let s = scale_vector(&v, b.min, 1.5, 1.0);
+        let nb = s.bounds();
+        assert!(matches!(s.kind, ShapeKind::Path { .. }));
+        assert!((nb.width() - b.width() * 1.5).abs() < 1e-2 && (nb.height() - b.height()).abs() < 1e-2);
     }
 }

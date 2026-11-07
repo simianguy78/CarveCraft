@@ -188,6 +188,17 @@ pub enum Drag {
     Freehand { pts: Vec<Pos2> },
     Sculpt { target: f32 },
     Node { id: u64, idx: usize },
+    /// Dragging a scale handle: `hx`/`hy` say which side (-1 min, 0 middle, 1 max).
+    Scale { orig: Vec<Vector>, bounds: Rect, hx: i8, hy: i8 },
+    /// Dragging a rotate handle around the selection centre.
+    Rotate { orig: Vec<Vector>, center: Pos2, a0: f32, angle: f32 },
+}
+
+/// A grab handle on the selection box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Handle {
+    Scale(i8, i8),
+    Rotate,
 }
 
 pub struct App {
