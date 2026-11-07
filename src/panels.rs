@@ -249,6 +249,11 @@ impl App {
                 self.form = Some(Form::Material);
                 ui.close_menu();
             }
+            if ui.button("Tool database…").clicked() {
+                self.db_sel = self.tool_idx;
+                self.show_tool_db = true;
+                ui.close_menu();
+            }
             ui.menu_button("Tool", |ui| {
                 for i in 0..self.tools.len() {
                     let name = self.tools[i].name.clone();
@@ -258,19 +263,19 @@ impl App {
         });
         ui.menu_button("Toolpaths", |ui| {
             for (label, op, tool) in [
-                ("Profile", crate::toolpath::Op::profile(6.0, crate::toolpath::Side::Outside), 0usize),
-                ("Pocket", crate::toolpath::Op::pocket(3.0, true), 0),
-                ("Drilling", crate::toolpath::Op::Drill { depth: 8.0 }, 0),
-                ("V-Carve", crate::toolpath::Op::VCarve { flat_depth: 0.0 }, 4),
-                ("Quick engrave", crate::toolpath::Op::Engrave { depth: 1.0 }, 6),
-                ("Fluting", crate::toolpath::Op::Fluting { depth: 3.0 }, 2),
-                ("3D roughing", crate::toolpath::Op::Rough3D { allowance: 0.5 }, 0),
-                ("3D finishing", crate::toolpath::Op::Finish3D, 2),
-                ("Texture", crate::toolpath::Op::Texture { depth: 1.0, length: 12.0 }, 3),
+                ("Profile", crate::toolpath::Op::profile(6.0, crate::toolpath::Side::Outside), (crate::toolpath::ToolKind::EndMill, 6.0)),
+                ("Pocket", crate::toolpath::Op::pocket(3.0, true), (crate::toolpath::ToolKind::EndMill, 6.0)),
+                ("Drilling", crate::toolpath::Op::Drill { depth: 8.0 }, (crate::toolpath::ToolKind::EndMill, 6.0)),
+                ("V-Carve", crate::toolpath::Op::VCarve { flat_depth: 0.0 }, (crate::toolpath::ToolKind::VBit, 60.0)),
+                ("Quick engrave", crate::toolpath::Op::Engrave { depth: 1.0 }, (crate::toolpath::ToolKind::VBit, 30.0)),
+                ("Fluting", crate::toolpath::Op::Fluting { depth: 3.0 }, (crate::toolpath::ToolKind::BallNose, 3.0)),
+                ("3D roughing", crate::toolpath::Op::Rough3D { allowance: 0.5 }, (crate::toolpath::ToolKind::EndMill, 6.0)),
+                ("3D finishing", crate::toolpath::Op::Finish3D, (crate::toolpath::ToolKind::BallNose, 3.0)),
+                ("Texture", crate::toolpath::Op::Texture { depth: 1.0, length: 12.0 }, (crate::toolpath::ToolKind::BallNose, 6.0)),
             ] {
                 if ui.button(label).clicked() {
                     self.pending_op = Some(op);
-                    self.tool_idx = tool;
+                    self.tool_idx = crate::tooldb::pick(&self.tools, tool.0, tool.1);
                     ui.close_menu();
                 }
             }
@@ -890,8 +895,12 @@ impl App {
                     ui.add(egui::TextEdit::singleline(text));
                     num(ui, "Letter height", size, 1.0..=1000.0, " mm");
                 }
-                ShapeKind::Path { pts, closed } => {
+                ShapeKind::Path { pts, closed, radii } => {
                     ui.label(format!("{} points, {}", pts.len(), if *closed { "closed" } else { "open" }));
+                    let rounded = radii.iter().filter(|r| **r > 0.0).count();
+                    if rounded > 0 {
+                        ui.label(RichText::new(format!("{rounded} rounded corner(s) – change them in Node edit or with Fillet")).small().color(pal.weak));
+                    }
                 }
             }
             num(ui, "Scale X", &mut v.scale.x, -100.0..=100.0, "×");

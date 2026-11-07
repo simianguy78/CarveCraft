@@ -52,7 +52,7 @@ fn scale_vector(v0: &Vector, anchor: Pos2, sx: f32, sy: f32) -> Vector {
         if polys.len() == 1 {
             let pts: Vec<Pos2> = polys[0].pts.iter().map(|p| pos2(anchor.x + (p.x - anchor.x) * sx, anchor.y + (p.y - anchor.y) * sy)).collect();
             let c = geom::bounds_of(&[geom::Poly { pts: pts.clone(), closed: polys[0].closed }]).center();
-            v.kind = ShapeKind::Path { pts: pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect(), closed: polys[0].closed };
+            v.kind = ShapeKind::Path { pts: pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect(), closed: polys[0].closed, radii: Vec::new() };
             v.center = c;
             v.angle = 0.0;
             v.scale = vec2(1.0, 1.0);
@@ -367,6 +367,7 @@ impl App {
                 let angle_lock = |i: usize| cons.iter().find_map(|c| if let geom::Constraint::Angle(j, d) = c { (*j == i).then_some(*d) } else { None });
                 let is_fixed = |i: usize| cons.contains(&geom::Constraint::Fixed(i));
                 let lines: Vec<usize> = self.seg_sel.iter().filter(|(sid, k)| *sid == id && *k < segs).map(|(_, k)| *k).collect();
+                let radii = self.node_radii();
                 // Picked lines glow.
                 for k in &lines {
                     let (a, b) = (to_s(pts[*k]), to_s(pts[(*k + 1) % n]));
@@ -432,6 +433,16 @@ impl App {
                     }
                 }
                 self.node_probe = pts.iter().map(|p| to_s(*p)).collect();
+                // Rounded corners show their radius just outside the corner.
+                for (i, r) in radii.iter().enumerate().filter(|(_, r)| **r > 0.0 && self.show_dims) {
+                    let (pv, nx) = Self::neighbours(n, closed, i);
+                    if let (Some(a), Some(b)) = (pv, nx) {
+                        let (sa, sv, sb) = (to_s(pts[a]), to_s(pts[i]), to_s(pts[b]));
+                        let bis = ((sa - sv).normalized() + (sb - sv).normalized()).normalized();
+                        let out_dir = if bis.x.is_nan() { vec2(0.0, -1.0) } else { -bis };
+                        tag(sv + out_dir * 22.0, format!("R {r:.1}"), Color32::from_rgb(120, 110, 220));
+                    }
+                }
                 for (i, p) in pts.iter().enumerate() {
                     let s = to_s(*p);
                     if picked == Some(i) {
@@ -461,6 +472,7 @@ impl App {
                         Remove(geom::Constraint),
                         Move(Pos2),
                         Turn(f32),
+                        Radius(f32),
                     }
                     let mut acts: Vec<Act> = Vec::new();
                     let at = rect.left_bottom() + vec2(14.0, -14.0);
@@ -487,6 +499,13 @@ impl App {
                                         ui.label("Angle");
                                         if ui.add(egui::DragValue::new(&mut deg).range(1.0..=179.0).speed(0.2).max_decimals(1).suffix("°")).changed() {
                                             acts.push(Act::Turn(deg));
+                                        }
+                                        ui.end_row();
+                                        // An editable corner radius (0 = sharp), like a sketch fillet.
+                                        let mut rad = radii.get(i).copied().unwrap_or(0.0);
+                                        ui.label("Radius");
+                                        if ui.add(egui::DragValue::new(&mut rad).range(0.0..=1000.0).speed(0.1).max_decimals(2).suffix(" mm")).on_hover_text("Round this corner; 0 makes it sharp again").changed() {
+                                            acts.push(Act::Radius(rad));
                                         }
                                         ui.end_row();
                                     }
@@ -573,6 +592,14 @@ impl App {
                                     self.edit_nodes(id, |q, _| q[i] = was);
                                     self.toast("That position breaks a constraint");
                                 }
+                            }
+                            Act::Radius(r) => {
+                                let Some(i) = picked else { continue };
+                                if !self.editing {
+                                    self.push_undo();
+                                    self.editing = true;
+                                }
+                                self.set_corner_radius(id, i, r);
                             }
                             Act::Turn(deg) => {
                                 let Some(i) = picked else { continue };
@@ -1199,8 +1226,35 @@ impl App {
     fn node_points(&self) -> Option<(u64, Vec<Pos2>, bool)> {
         let id = *self.sel.first()?;
         let v = self.doc.vectors.iter().find(|v| v.id == id)?;
-        let polys = v.polys();
-        (polys.len() == 1).then(|| (id, polys[0].pts.clone(), polys[0].closed))
+        let (pts, closed, _) = v.control_points()?;
+        Some((id, pts, closed))
+    }
+
+    /// Corner radius at each node of the shape being node-edited.
+    pub fn node_radii(&self) -> Vec<f32> {
+        self.sel
+            .first()
+            .and_then(|id| self.doc.vectors.iter().find(|v| v.id == *id))
+            .and_then(|v| v.control_points())
+            .map(|(_, _, r)| r)
+            .unwrap_or_default()
+    }
+
+    /// Set the corner radius at node `i` of shape `id` (0 makes it sharp again).
+    pub fn set_corner_radius(&mut self, id: u64, i: usize, r: f32) {
+        if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == id) {
+            if v.to_path() {
+                if let ShapeKind::Path { pts, radii, .. } = &mut v.kind {
+                    radii.resize(pts.len(), 0.0);
+                    if let Some(x) = radii.get_mut(i) {
+                        *x = r.max(0.0);
+                    }
+                    if radii.iter().all(|x| *x <= 0.0) {
+                        radii.clear();
+                    }
+                }
+            }
+        }
     }
 
     /// Run `f` on the node points of shape `id` in job coordinates (turning it into a free
@@ -1209,9 +1263,23 @@ impl App {
         if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == id) {
             if v.to_path() {
                 let c = v.center;
-                if let ShapeKind::Path { pts, closed } = &mut v.kind {
-                    let mut world: Vec<Pos2> = pts.iter().map(|p| pos2(p.x + c.x, p.y + c.y)).collect();
+                if let ShapeKind::Path { pts, closed, radii } = &mut v.kind {
+                    let before: Vec<Pos2> = pts.iter().map(|p| pos2(p.x + c.x, p.y + c.y)).collect();
+                    let mut world = before.clone();
                     f(&mut world, *closed);
+                    // Keep corner radii with their points when one is added or removed.
+                    if !radii.is_empty() {
+                        radii.resize(before.len(), 0.0);
+                        let common = before.len().min(world.len());
+                        let at = (0..common).find(|&i| before[i] != world[i]).unwrap_or(common);
+                        if world.len() == before.len() + 1 {
+                            radii.insert(at, 0.0);
+                        } else if world.len() + 1 == before.len() {
+                            radii.remove(at.min(radii.len() - 1));
+                        } else {
+                            radii.resize(world.len(), 0.0);
+                        }
+                    }
                     *pts = world.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect();
                 }
             }
@@ -1463,11 +1531,8 @@ impl App {
     fn fillet_at(&mut self, p: Pos2, tol: f32) {
         let mut best: Option<(f32, u64, usize)> = None;
         for v in self.doc.vectors.iter().filter(|v| self.visible_vector(v)) {
-            let polys = v.polys();
-            if polys.len() != 1 {
-                continue;
-            }
-            for (i, q) in polys[0].pts.iter().enumerate() {
+            let Some((pts, _, _)) = v.control_points() else { continue };
+            for (i, q) in pts.iter().enumerate() {
                 let d = (*q - p).length();
                 if d <= tol && best.is_none_or(|(bd, _, _)| d < bd) {
                     best = Some((d, v.id, i));
@@ -1478,20 +1543,23 @@ impl App {
             self.toast("Click on a corner");
             return;
         };
+        // A corner keeps its radius as a setting, so clicking it again updates it.
+        let corner = self.doc.vectors.iter().find(|v| v.id == id).and_then(|v| v.control_points()).is_some_and(|(pts, closed, _)| {
+            let n = pts.len();
+            match geom::corner_neighbours(n, closed, i) {
+                (Some(a), Some(b)) => (pts[a] - pts[i]).normalized().dot((pts[b] - pts[i]).normalized()) > -0.999,
+                _ => false,
+            }
+        });
+        if !corner {
+            self.toast("That point isn't a corner");
+            return;
+        }
         self.push_undo();
         let r = self.p.fillet_r;
-        let mut ok = false;
-        if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == id) {
-            if v.to_path() {
-                if let ShapeKind::Path { pts, closed } = &mut v.kind {
-                    ok = geom::fillet_corner(pts, *closed, i, r);
-                }
-            }
-        }
-        if !ok {
-            self.undo.pop();
-            self.toast("That point isn't a corner");
-        }
+        let was = self.doc.vectors.iter().find(|v| v.id == id).and_then(|v| v.control_points()).and_then(|(_, _, rs)| rs.get(i).copied()).unwrap_or(0.0);
+        self.set_corner_radius(id, i, r);
+        self.toast(if was > 0.0 { format!("Corner radius changed from {was:.1} to {r:.1} mm") } else { format!("Corner rounded, radius {r:.1} mm") });
     }
 
     pub fn view_3d(&mut self, ui: &mut Ui) {

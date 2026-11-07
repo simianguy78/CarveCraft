@@ -11,7 +11,14 @@ pub enum ShapeKind {
     Ellipse { rx: f32, ry: f32 },
     Polygon { r: f32, sides: u32 },
     Star { r1: f32, r2: f32, points: u32 },
-    Path { pts: Vec<Pos2>, closed: bool },
+    Path {
+        pts: Vec<Pos2>,
+        closed: bool,
+        /// Corner radius at each point (0 or missing = sharp), kept editable rather than
+        /// baked into the outline.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        radii: Vec<f32>,
+    },
     Text { text: String, size: f32 },
 }
 
@@ -104,7 +111,7 @@ impl Vector {
                     .collect();
                 vec![Poly { pts, closed: true }]
             }
-            ShapeKind::Path { pts, closed } => vec![Poly { pts: pts.clone(), closed: *closed }],
+            ShapeKind::Path { pts, closed, radii } => vec![Poly { pts: rounded_outline(pts, *closed, radii), closed: *closed }],
             ShapeKind::Text { text, size } => text_outlines(text, *size),
         }
     }
@@ -400,15 +407,51 @@ impl Field {
 // ---------------------------------------------------------------- vector editing
 
 impl Vector {
-    /// Bake the shape into an editable path (one outline only) with no rotation or scale.
+    /// The shape's editable points in job coordinates and their corner radii: a curve's own
+    /// points (not its rounded outline), a rectangle's four corners, else its outline's points.
+    pub fn control_points(&self) -> Option<(Vec<Pos2>, bool, Vec<f32>)> {
+        let s = (self.scale.x * self.scale.y).abs().sqrt();
+        match &self.kind {
+            ShapeKind::Path { pts, closed, radii } => {
+                let mut r: Vec<f32> = radii.iter().map(|x| x * s).collect();
+                r.resize(pts.len(), 0.0);
+                Some((pts.iter().map(|p| self.transform_point(*p)).collect(), *closed, r))
+            }
+            ShapeKind::Rect { w, h, r } => {
+                let (hw, hh) = (w * 0.5, h * 0.5);
+                let rr = r.min(hw).min(hh).max(0.0) * s;
+                let corners = [pos2(-hw, -hh), pos2(hw, -hh), pos2(hw, hh), pos2(-hw, hh)];
+                Some((corners.iter().map(|p| self.transform_point(*p)).collect(), true, vec![rr; 4]))
+            }
+            _ => {
+                let polys = self.polys();
+                (polys.len() == 1).then(|| {
+                    let n = polys[0].pts.len();
+                    (polys[0].pts.clone(), polys[0].closed, vec![0.0; n])
+                })
+            }
+        }
+    }
+
+    /// Make the shape an editable path (one outline only) with no rotation or scale.
+    /// Curves and rectangles keep their corner radii editable.
     pub fn to_path(&mut self) -> bool {
+        if matches!(self.kind, ShapeKind::Path { .. } | ShapeKind::Rect { .. }) {
+            let Some((pts, closed, radii)) = self.control_points() else { return false };
+            let c = self.center;
+            let radii = if radii.iter().any(|r| *r > 0.0) { radii } else { Vec::new() };
+            self.kind = ShapeKind::Path { pts: pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect(), closed, radii };
+            self.angle = 0.0;
+            self.scale = vec2(1.0, 1.0);
+            return true;
+        }
         let polys = self.polys();
         if polys.len() != 1 {
             return false;
         }
         let poly = &polys[0];
         let c = self.center;
-        self.kind = ShapeKind::Path { pts: poly.pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect(), closed: poly.closed };
+        self.kind = ShapeKind::Path { pts: poly.pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect(), closed: poly.closed, radii: Vec::new() };
         self.angle = 0.0;
         self.scale = vec2(1.0, 1.0);
         true
@@ -565,6 +608,58 @@ pub fn trim(poly: &Poly, others: &[Poly], click: Pos2) -> Option<Vec<Poly>> {
     }
     out.retain(|p| p.pts.len() >= 2 && poly_length(&p.pts) > 1e-3);
     Some(out)
+}
+
+/// The outline of a path whose corners have radii: each rounded corner becomes a true arc
+/// (within 0.01 mm), shrunk only if the neighbouring lines are too short to fit it.
+pub fn rounded_outline(pts: &[Pos2], closed: bool, radii: &[f32]) -> Vec<Pos2> {
+    let n = pts.len();
+    if n < 3 || !radii.iter().any(|r| *r > 0.0) {
+        return pts.to_vec();
+    }
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let p = pts[i];
+        let r = radii.get(i).copied().unwrap_or(0.0);
+        let end = !closed && (i == 0 || i == n - 1);
+        if r <= 0.0 || end {
+            out.push(p);
+            continue;
+        }
+        let (a, b) = (pts[(i + n - 1) % n], pts[(i + 1) % n]);
+        let (la, lb) = ((a - p).length(), (b - p).length());
+        if la < 1e-6 || lb < 1e-6 {
+            out.push(p);
+            continue;
+        }
+        let (u, v) = ((a - p) / la, (b - p) / lb);
+        let theta = u.dot(v).clamp(-1.0, 1.0).acos();
+        if theta > std::f32::consts::PI - 0.01 || theta < 0.01 {
+            out.push(p);
+            continue;
+        }
+        // Each line gives at most half its length to each of its two corners.
+        let t = (r / (theta * 0.5).tan()).min(la * 0.5).min(lb * 0.5);
+        let r = t * (theta * 0.5).tan();
+        let centre = p + (u + v).normalized() * (t / (theta * 0.5).cos());
+        let (s, e) = (p + u * t, p + v * t);
+        let (a0, a1) = ((s - centre).angle(), (e - centre).angle());
+        let mut sweep = a1 - a0;
+        while sweep > std::f32::consts::PI {
+            sweep -= std::f32::consts::TAU;
+        }
+        while sweep < -std::f32::consts::PI {
+            sweep += std::f32::consts::TAU;
+        }
+        // enough steps that the chords stay within 0.01 mm of the arc
+        let step = 2.0 * (1.0 - 0.01 / r.max(0.011)).clamp(-1.0, 1.0).acos();
+        let k = ((sweep.abs() / step.max(0.01)).ceil() as usize).clamp(2, 180);
+        for j in 0..=k {
+            let ang = a0 + sweep * j as f32 / k as f32;
+            out.push(centre + vec2(ang.cos(), ang.sin()) * r);
+        }
+    }
+    out
 }
 
 /// Round the corner at vertex `i` with radius `r`. Returns false if it is not a corner.
@@ -1274,5 +1369,61 @@ mod offset_tests {
         let hole = out.iter().find(|p| signed_area(&p.pts) < 0.0).expect("hole stays a hole");
         let hb = bounds_of(std::slice::from_ref(hole));
         assert!((hb.width() - 56.0).abs() < 0.002, "the hole shrinks as the frame grows: {hb:?}");
+    }
+}
+
+#[cfg(test)]
+mod corner_radius_tests {
+    use super::*;
+
+    fn square() -> Vec<Pos2> {
+        vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0), pos2(0.0, 100.0)]
+    }
+
+    #[test]
+    fn radius_draws_a_true_arc_and_stays_editable() {
+        let mut v = Vector::new(1, ShapeKind::Path { pts: square(), closed: true, radii: vec![10.0; 4] }, pos2(0.0, 0.0), 0);
+        let out = &v.polys()[0].pts;
+        let b = bounds_of(&v.polys());
+        assert!((b.width() - 100.0).abs() < 1e-3 && (b.height() - 100.0).abs() < 1e-3);
+        // points near the top-right corner lie on a 10 mm circle round (90, 90)
+        let near: Vec<&Pos2> = out.iter().filter(|p| p.x > 90.0 && p.y > 90.0).collect();
+        assert!(near.len() >= 3);
+        for p in near {
+            assert!(((*p - pos2(90.0, 90.0)).length() - 10.0).abs() < 0.01, "{p:?}");
+        }
+        // still only the four corners to edit
+        let (pts, _, r) = v.control_points().unwrap();
+        assert_eq!(pts.len(), 4);
+        assert_eq!(r, vec![10.0; 4]);
+        // change one radius later: the outline follows
+        if let ShapeKind::Path { radii, .. } = &mut v.kind {
+            radii[2] = 25.0;
+        }
+        let near: Vec<Pos2> = v.polys()[0].pts.iter().copied().filter(|p| p.x > 75.0 && p.y > 75.0 && p.x < 99.9 && p.y < 99.9).collect();
+        assert!(near.iter().all(|p| ((*p - pos2(75.0, 75.0)).length() - 25.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn rounded_rectangle_keeps_its_radius_as_a_path() {
+        let mut v = Vector::new(1, ShapeKind::Rect { w: 80.0, h: 40.0, r: 6.0 }, pos2(50.0, 50.0), 0);
+        let before = bounds_of(&v.polys());
+        assert!(v.to_path());
+        match &v.kind {
+            ShapeKind::Path { pts, radii, .. } => {
+                assert_eq!(pts.len(), 4);
+                assert_eq!(radii, &vec![6.0; 4]);
+            }
+            _ => panic!("expected a path"),
+        }
+        let after = bounds_of(&v.polys());
+        assert!((before.width() - after.width()).abs() < 1e-3 && (before.height() - after.height()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn too_big_radius_shrinks_to_fit() {
+        let v = Vector::new(1, ShapeKind::Path { pts: square(), closed: true, radii: vec![80.0; 4] }, pos2(0.0, 0.0), 0);
+        let b = bounds_of(&v.polys());
+        assert!((b.width() - 100.0).abs() < 1e-3, "corners meet in the middle of each side but don't overshoot");
     }
 }

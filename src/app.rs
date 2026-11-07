@@ -236,6 +236,9 @@ pub struct App {
     pub sim_running: bool,
     pub sim_speed: f32,
     pub show_tool_db: bool,
+    pub tool_materials: Vec<String>,
+    pub tool_material: String,
+    pub db_sel: usize,
     /// Node editing: the picked node (shape id, index), corners with a locked angle,
     /// the segment length being typed, and where last frame's length labels were drawn.
     pub node_sel: Option<(u64, usize)>,
@@ -291,8 +294,8 @@ impl App {
             form: None,
             p: Params::default(),
             pending_op: None,
-            tools: Tool::defaults(),
-            tool_idx: 2,
+            tools: Vec::new(),
+            tool_idx: 0,
             v2_center: pos2(150.0, 100.0),
             v2_zoom: 2.0,
             fit_2d: true,
@@ -309,6 +312,9 @@ impl App {
             sim_running: false,
             sim_speed: 3.2,
             show_tool_db: false,
+            tool_materials: Vec::new(),
+            tool_material: String::new(),
+            db_sel: 0,
             node_sel: None,
             len_edit: None,
             node_len_tags: Vec::new(),
@@ -341,6 +347,13 @@ impl App {
             frames: 0,
             shot_sent: false,
         };
+        {
+            let lib = crate::tooldb::load();
+            app.tools = lib.tools;
+            app.tool_materials = lib.materials;
+            app.tool_material = lib.material;
+            app.tool_idx = crate::tooldb::pick(&app.tools, crate::toolpath::ToolKind::BallNose, 3.0);
+        }
         // Start-up view overrides, handy for checking screens: CARVECRAFT_START=2d|design|light|sim
         for opt in std::env::var("CARVECRAFT_START").unwrap_or_default().split(',') {
             if !opt.trim().is_empty() && opt.trim() != "home" {
@@ -351,6 +364,10 @@ impl App {
                 "design" => app.left_tab = LeftTab::Design,
                 "light" => app.dark = false,
                 "rotate" => app.script_rotate = true,
+                "tooldb" => {
+                    app.show_tool_db = true;
+                    app.db_sel = app.tool_idx;
+                }
                 "profile" => {
                     let mut op = Op::profile(6.0, crate::toolpath::Side::Outside);
                     if let Op::Profile { tabs, ramp, .. } = &mut op {
@@ -358,12 +375,12 @@ impl App {
                         *ramp = 10.0;
                     }
                     app.pending_op = Some(op);
-                    app.tool_idx = 0;
+                    app.tool_idx = crate::tooldb::pick(&app.tools, crate::toolpath::ToolKind::EndMill, 6.0);
                 }
                 "dense" => {
                     // Node-edit the rounded plaque outline: lots of short segments.
                     app.tool = DrawTool::Node;
-                    app.sel = app.doc.vectors.iter().take(1).map(|v| v.id).collect();
+                    app.sel = app.doc.vectors.iter().filter(|v| matches!(v.kind, crate::geom::ShapeKind::Rect { .. })).take(1).map(|v| v.id).collect();
                 }
                 "cons" => {
                     // A slanted four-sided shape with a few sketch constraints applied.
@@ -758,8 +775,17 @@ impl App {
                 skipped += 1;
                 continue;
             }
-            if let ShapeKind::Path { pts, closed } = &mut v.kind {
-                *pts = geom::fillet_all(pts, *closed, r);
+            // Every corner sharper than about 170 degrees gets the radius, kept editable.
+            if let ShapeKind::Path { pts, closed, radii } = &mut v.kind {
+                let n = pts.len();
+                radii.resize(n, 0.0);
+                for i in 0..n {
+                    if let (Some(a), Some(b)) = geom::corner_neighbours(n, *closed, i) {
+                        if (pts[a] - pts[i]).normalized().dot((pts[b] - pts[i]).normalized()) > -0.985 {
+                            radii[i] = r;
+                        }
+                    }
+                }
             }
         }
         self.toast(if skipped > 0 { format!("Corners rounded ({skipped} multi-outline shape(s) skipped)") } else { "Corners rounded".to_string() });
@@ -984,7 +1010,7 @@ impl App {
         }
         let c = b.center();
         let local = pts.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect();
-        self.add_vector(ShapeKind::Path { pts: local, closed }, c)
+        self.add_vector(ShapeKind::Path { pts: local, closed, radii: Vec::new() }, c)
     }
 
     fn handle_screenshot(&mut self, ctx: &egui::Context) {
@@ -1182,6 +1208,7 @@ impl eframe::App for App {
         self.status_bar(ctx);
         let fill = ctx.style().visuals.panel_fill;
         self.guide_window(ctx);
+        self.tool_db_window(ctx);
         if self.home {
             egui::SidePanel::left("start")
                 .exact_width(304.0)

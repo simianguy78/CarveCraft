@@ -63,7 +63,7 @@ the code in this repository.
 | Tool database (end mill, ball nose, V-bit) | ✅ | ✅ | ✅ |
 | Tool types: flat-bottom V, radiused, form, drill, engraving tip | ✅ | ✅ | ❌ |
 | Feeds, speeds, flutes, chip load | ✅ | ✅ | ✅ |
-| Saved tool library with per-material settings | ✅ | ✅ | 🟡 (edits last for the session; each toolpath keeps its tool) |
+| Saved tool library with per-material settings | ✅ | ✅ | ✅ (groups, notes, materials, import/export) |
 | Material setup: size, thickness, Z zero top / bed | ✅ | ✅ | ✅ |
 | XY datum: corners, centre, offset | ✅ | ✅ | 🟡 (bottom-left or centre) |
 | Safe Z and home position | ✅ | ✅ | 🟡 (safe Z; returns to the origin at the end) |

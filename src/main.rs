@@ -8,6 +8,7 @@ mod panels_right;
 mod render3d;
 mod start;
 mod theme;
+mod tooldb;
 mod toolpath;
 mod views;
 

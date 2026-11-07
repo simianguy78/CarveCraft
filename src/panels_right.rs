@@ -59,7 +59,7 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             self.material_setup(ui);
             let pending = self.pending_op.clone();
-            let mut pick: Option<(Op, usize)> = None;
+            let mut pick: Option<(Op, (ToolKind, f32))> = None;
             let mut toggle_tools = false;
             let show_tools = self.show_tool_db;
             let is_on = |op: &Op| pending.as_ref().is_some_and(|p| std::mem::discriminant(p) == std::mem::discriminant(op));
@@ -68,15 +68,15 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 let ops = [
-                    ("profile", Op::profile(6.0, Side::Outside), 0usize, "Profile – cut around or along vectors"),
-                    ("pocket", Op::pocket(3.0, true), 0, "Pocket – clear out the inside of shapes"),
-                    ("drill", Op::Drill { depth: 8.0 }, 0, "Drilling – holes at the centre of shapes"),
-                    ("vcarve", Op::VCarve { flat_depth: 0.0 }, 4, "V-Carve – sharp V-grooves, ideal for lettering"),
-                    ("engrave", Op::Engrave { depth: 1.0 }, 6, "Quick engrave – trace vectors at a fixed depth"),
-                    ("fluting", Op::Fluting { depth: 3.0 }, 2, "Fluting – grooves that ramp in and out"),
-                    ("rough3d", Op::Rough3D { allowance: 0.5 }, 0, "3D roughing – remove bulk material in steps"),
-                    ("finish3d", Op::Finish3D, 2, "3D finishing – follow the surface with a ball-nose"),
-                    ("texture_tp", Op::Texture { depth: 1.0, length: 12.0 }, 3, "Texture – hand-tooled strokes"),
+                    ("profile", Op::profile(6.0, Side::Outside), (ToolKind::EndMill, 6.0), "Profile – cut around or along vectors"),
+                    ("pocket", Op::pocket(3.0, true), (ToolKind::EndMill, 6.0), "Pocket – clear out the inside of shapes"),
+                    ("drill", Op::Drill { depth: 8.0 }, (ToolKind::EndMill, 6.0), "Drilling – holes at the centre of shapes"),
+                    ("vcarve", Op::VCarve { flat_depth: 0.0 }, (ToolKind::VBit, 60.0), "V-Carve – sharp V-grooves, ideal for lettering"),
+                    ("engrave", Op::Engrave { depth: 1.0 }, (ToolKind::VBit, 30.0), "Quick engrave – trace vectors at a fixed depth"),
+                    ("fluting", Op::Fluting { depth: 3.0 }, (ToolKind::BallNose, 3.0), "Fluting – grooves that ramp in and out"),
+                    ("rough3d", Op::Rough3D { allowance: 0.5 }, (ToolKind::EndMill, 6.0), "3D roughing – remove bulk material in steps"),
+                    ("finish3d", Op::Finish3D, (ToolKind::BallNose, 3.0), "3D finishing – follow the surface with a ball-nose"),
+                    ("texture_tp", Op::Texture { depth: 1.0, length: 12.0 }, (ToolKind::BallNose, 6.0), "Texture – hand-tooled strokes"),
                 ];
                 for (icon, op, tool, tip) in ops {
                     if icons::icon_tile(ui, dark, icon, is_on(&op), tip).clicked() {
@@ -88,16 +88,13 @@ impl App {
                 }
             });
             ui.add_space(6.0);
-            if let Some((op, tool)) = pick {
+            if let Some((op, (kind, size))) = pick {
                 self.pending_op = Some(op);
-                self.tool_idx = tool;
+                self.tool_idx = crate::tooldb::pick(&self.tools, kind, size);
             }
             if toggle_tools {
                 self.show_tool_db = !self.show_tool_db;
-            }
-            if self.show_tool_db && self.pending_op.is_none() {
-                let pal = theme::palette(dark);
-                card(ui, dark, "Tool database", |ui| tool_editor(ui, &pal, &mut self.tools, &mut self.tool_idx));
+                self.db_sel = self.tool_idx;
             }
             if self.pending_op.is_some() {
                 self.op_form(ui);
@@ -153,6 +150,7 @@ impl App {
         let dark = self.dark;
         let pal = theme::palette(dark);
         let nsel = self.sel.len();
+        let mut open_db = false;
         let mut calc = false;
         let mut cancel = false;
         let Some(op) = &mut self.pending_op else { return };
@@ -233,7 +231,12 @@ impl App {
                 }
             }
             ui.add_space(4.0);
-            ui.label(RichText::new("Tool").strong());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Tool").strong());
+                if ui.small_button("Tool database…").on_hover_text("Pick or edit tools, feeds and speeds per material").clicked() {
+                    open_db = true;
+                }
+            });
             tool_editor(ui, &pal, &mut self.tools, &mut self.tool_idx);
             if op.needs_vectors() {
                 let msg = if nsel == 0 { "Select vectors in the 2D view first".to_string() } else { format!("{nsel} vector(s) selected") };
@@ -250,6 +253,10 @@ impl App {
                 }
             });
         });
+        if open_db {
+            self.db_sel = self.tool_idx;
+            self.show_tool_db = true;
+        }
         if calc {
             self.calculate_pending();
         }

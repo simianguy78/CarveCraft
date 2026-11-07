@@ -65,6 +65,24 @@ pub struct Tool {
     pub number: u32,
     #[serde(default = "two_flutes")]
     pub flutes: u32,
+    /// Library group (End Mills, V-Bits…).
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub notes: String,
+    /// Feeds and speeds saved per material (the current material's are in the fields above).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub materials: std::collections::BTreeMap<String, Cutting>,
+}
+
+/// The settings a tool can have per material.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cutting {
+    pub stepover: f32,
+    pub pass_depth: f32,
+    pub feed: f32,
+    pub plunge: f32,
+    pub rpm: f32,
 }
 
 fn two_flutes() -> u32 {
@@ -72,8 +90,8 @@ fn two_flutes() -> u32 {
 }
 
 impl Tool {
-    fn new(n: u32, name: &str, kind: ToolKind, dia: f32, angle: f32, stepover: f32, pass: f32, feed: f32) -> Tool {
-        Tool { name: name.into(), kind, diameter: dia, angle, stepover, pass_depth: pass, feed, plunge: feed * 0.4, rpm: 18000.0, number: n, flutes: 2 }
+    pub fn new(n: u32, name: &str, kind: ToolKind, dia: f32, angle: f32, stepover: f32, pass: f32, feed: f32) -> Tool {
+        Tool { name: name.into(), kind, diameter: dia, angle, stepover, pass_depth: pass, feed, plunge: feed * 0.4, rpm: 18000.0, number: n, flutes: 2, group: String::new(), notes: String::new(), materials: Default::default() }
     }
 
     pub fn defaults() -> Vec<Tool> {
