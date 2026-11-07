@@ -40,3 +40,16 @@ Options:
 
 Wheel zooms, right-drag pans, and left-drag orbits the 3D view.
 Keys: Ctrl+Z / Ctrl+Y undo and redo, Ctrl+D duplicate, Del delete, Esc back to Select, F2 / F3 switch 2D / 3D.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you say otherwise, any contribution you submit is offered under the
+same two licences.
+
+CarveCraft is an independent project, not affiliated with Vectric; VCarve and Aspire are
+their trademarks.
