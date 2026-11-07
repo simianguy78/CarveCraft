@@ -237,6 +237,8 @@ pub struct App {
     pub sim_speed: f32,
     pub show_tool_db: bool,
     pub show_export: bool,
+    /// The job settings as they were when Job Setup opened (for Cancel).
+    pub job_backup: Option<Material>,
     pub export_pick: Vec<u64>,
     pub export_split: bool,
     pub tool_materials: Vec<String>,
@@ -316,6 +318,7 @@ impl App {
             sim_speed: 3.2,
             show_tool_db: false,
             show_export: false,
+            job_backup: None,
             export_pick: Vec::new(),
             export_split: false,
             tool_materials: Vec::new(),
@@ -371,6 +374,7 @@ impl App {
                 "light" => app.dark = false,
                 "rotate" => app.script_rotate = true,
                 "export" => app.open_export(None),
+                "job" => app.form = Some(Form::Material),
                 "tooldb" => {
                     app.show_tool_db = true;
                     app.db_sel = app.tool_idx;
@@ -1202,6 +1206,9 @@ impl eframe::App for App {
         self.status_bar(ctx);
         let fill = ctx.style().visuals.panel_fill;
         self.guide_window(ctx);
+        if self.form != Some(Form::Material) && self.job_backup.take().is_some() {
+            self.apply_job();
+        }
         self.tool_db_window(ctx);
         self.export_window(ctx);
         if self.home {

@@ -190,10 +190,7 @@ impl App {
         }
         painter.rect_stroke(mr, CornerRadius::same(2), Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Outside);
         // origin marker
-        let o = to_s(match mat.origin {
-            crate::toolpath::Origin::BottomLeft => pos2(0.0, 0.0),
-            crate::toolpath::Origin::Center => pos2(mat.w * 0.5, mat.h * 0.5),
-        });
+        let o = to_s(mat.xy_zero());
         painter.arrow(o, vec2(28.0, 0.0), Stroke::new(2.0_f32, Color32::from_rgb(235, 87, 87)));
         painter.arrow(o, vec2(0.0, -28.0), Stroke::new(2.0_f32, Color32::from_rgb(76, 200, 120)));
 

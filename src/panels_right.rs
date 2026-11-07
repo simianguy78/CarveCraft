@@ -127,10 +127,7 @@ impl App {
                     ui.label(RichText::new(format!("Thickness {} mm", m.thickness)).strong());
                     let z = if m.z_bed { "Z zero: machine bed" } else { "Z zero: material top" };
                     ui.label(RichText::new(z).small().color(pal.weak));
-                    let datum = match m.origin {
-                        crate::toolpath::Origin::BottomLeft => "XY datum: bottom-left",
-                        crate::toolpath::Origin::Center => "XY datum: centre",
-                    };
+                    let datum = format!("XY datum: {}", m.origin.label().replace(" corner", ""));
                     ui.label(RichText::new(format!("{datum} · safe Z {} mm", m.safe_z)).small().color(pal.weak));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -472,6 +472,10 @@ impl App {
     }
 
     fn form_card(&mut self, ui: &mut Ui, f: Form) {
+        if f == Form::Material {
+            self.job_setup_form(ui);
+            return;
+        }
         let dark = self.dark;
         let pal = theme::palette(dark);
         let title = match f {
@@ -1166,6 +1170,198 @@ impl App {
             }
             self.doc.model.composite_only();
             self.invalidate_sim();
+        }
+    }
+}
+
+impl App {
+    /// Apply the job setup: resample the model to the new size and resolution, recalculate.
+    pub fn apply_job(&mut self) {
+        let (w, h, cells) = (self.doc.material.w, self.doc.material.h, self.doc.material.resolution.cells());
+        self.doc.model.resize_cells(w, h, cells);
+        let (mm, mat) = (&self.doc.model, &self.doc.material);
+        for t in &mut self.doc.toolpaths {
+            t.calculate(mm, mat);
+        }
+        self.invalidate_sim();
+        self.fit_2d = true;
+    }
+
+    /// The Job Setup form, laid out like the original: type, size and units, Z zero,
+    /// XY datum, modelling resolution, then OK / Cancel.
+    fn job_setup_form(&mut self, ui: &mut Ui) {
+        let dark = self.dark;
+        let pal = theme::palette(dark);
+        if self.job_backup.is_none() {
+            self.job_backup = Some(self.doc.material.clone());
+        }
+        let art = |ui: &mut Ui, which: &str, on: bool| {
+            let (r, _) = ui.allocate_exact_size(vec2(62.0, 50.0), egui::Sense::hover());
+            icons::job_art(ui.painter(), r, which, on);
+        };
+        let section = |ui: &mut Ui, title: &str, add: &mut dyn FnMut(&mut Ui)| {
+            egui::Frame::new().fill(pal.card).corner_radius(CornerRadius::same(10)).stroke(egui::Stroke::new(1.0_f32, pal.border)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(title).strong());
+                ui.add_space(2.0);
+                add(ui);
+            });
+            ui.add_space(6.0);
+        };
+        let inch = self.doc.material.inches;
+        let unit = if inch { " in" } else { " mm" };
+        let k = if inch { 1.0 / 25.4 } else { 1.0 };
+        // a length typed in the chosen units, stored in mm
+        let len = |ui: &mut Ui, v: &mut f32, lo: f32, hi: f32| {
+            let mut x = *v * k;
+            let r = ui.add(egui::DragValue::new(&mut x).range(lo * k..=hi * k).speed(if inch { 0.01 } else { 0.1 }).max_decimals(if inch { 3 } else { 2 }).suffix(unit));
+            if r.changed() {
+                *v = x / k;
+            }
+        };
+
+        // title with the job icon
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(26.0, 24.0), egui::Sense::hover());
+            icons::draw(ui.painter(), r, ACCENT, "job");
+            ui.label(RichText::new("Job Setup").strong().size(16.0));
+        });
+        ui.add_space(4.0);
+
+        section(ui, "Job Type", &mut |ui| {
+            ui.horizontal(|ui| {
+                art(ui, "type", false);
+                ui.vertical(|ui| {
+                    let _ = ui.radio(true, "Single sided");
+                    ui.add_enabled(false, egui::RadioButton::new(false, "Double sided")).on_disabled_hover_text("Not available yet");
+                    ui.add_enabled(false, egui::RadioButton::new(false, "Rotary")).on_disabled_hover_text("Not available yet");
+                });
+            });
+        });
+
+        let m = &mut self.doc.material;
+        section(ui, "Job Size", &mut |ui| {
+            ui.horizontal(|ui| {
+                art(ui, "size", false);
+                egui::Grid::new("job_size").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+                    ui.label("Width (X)");
+                    len(ui, &mut m.w, 10.0, 5000.0);
+                    ui.end_row();
+                    ui.label("Height (Y)");
+                    len(ui, &mut m.h, 10.0, 5000.0);
+                    ui.end_row();
+                    ui.label("Thickness (Z)");
+                    len(ui, &mut m.thickness, 0.5, 300.0);
+                    ui.end_row();
+                    ui.label("Safe Z");
+                    len(ui, &mut m.safe_z, 0.5, 100.0);
+                    ui.end_row();
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Units").strong());
+                ui.radio_value(&mut m.inches, true, "inches");
+                ui.radio_value(&mut m.inches, false, "mm");
+            });
+        });
+
+        section(ui, "Z Zero Position", &mut |ui| {
+            ui.horizontal(|ui| {
+                art(ui, "zzero", m.z_bed);
+                ui.vertical(|ui| {
+                    ui.radio_value(&mut m.z_bed, false, "Material surface");
+                    ui.radio_value(&mut m.z_bed, true, "Machine bed");
+                });
+            });
+        });
+
+        section(ui, "XY Datum Position", &mut |ui| {
+            ui.horizontal(|ui| {
+                art(ui, "datum", false);
+                // four corners and the centre of the sheet, the chosen one filled
+                let (r, _) = ui.allocate_exact_size(vec2(66.0, 66.0), egui::Sense::hover());
+                let sq = r.shrink(9.0);
+                ui.painter().rect_stroke(sq, CornerRadius::same(2), egui::Stroke::new(1.2_f32, pal.weak), egui::StrokeKind::Middle);
+                for (o, at) in [
+                    (Origin::TopLeft, sq.left_top()),
+                    (Origin::TopRight, sq.right_top()),
+                    (Origin::Center, sq.center()),
+                    (Origin::BottomLeft, sq.left_bottom()),
+                    (Origin::BottomRight, sq.right_bottom()),
+                ] {
+                    let hit = ui.interact(egui::Rect::from_center_size(at, vec2(16.0, 16.0)), ui.id().with(("datum", o.label())), egui::Sense::click());
+                    let on = m.origin == o;
+                    ui.painter().circle_filled(at, 6.5, if hit.hovered() { pal.tile_hover } else { pal.sheet });
+                    ui.painter().circle_stroke(at, 6.5, egui::Stroke::new(1.2_f32, pal.weak));
+                    if on {
+                        ui.painter().circle_filled(at, 3.5, ACCENT);
+                    }
+                    if hit.on_hover_text(format!("X0 Y0 at the {}", o.label())).clicked() {
+                        m.origin = o;
+                    }
+                }
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut m.use_offset, "Use offset");
+                    ui.add_enabled_ui(m.use_offset, |ui| {
+                        let mut ox = m.offset[0];
+                        let mut oy = m.offset[1];
+                        ui.horizontal(|ui| {
+                            ui.label("X");
+                            len(ui, &mut ox, -5000.0, 5000.0);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Y");
+                            len(ui, &mut oy, -5000.0, 5000.0);
+                        });
+                        m.offset = [ox, oy];
+                    });
+                });
+            });
+        });
+
+        let points = {
+            let g = crate::model::Grid::for_material_cells(m.w, m.h, m.resolution.cells());
+            g.nx * g.ny
+        };
+        section(ui, "Modeling Resolution", &mut |ui| {
+            ui.horizontal(|ui| {
+                art(ui, "resolution", false);
+                ui.vertical(|ui| {
+                    egui::ComboBox::from_id_salt("job_res").width(150.0).selected_text(m.resolution.label()).show_ui(ui, |ui| {
+                        for r in crate::toolpath::Resolution::ALL {
+                            ui.selectable_value(&mut m.resolution, r, r.label());
+                        }
+                    });
+                    ui.label(RichText::new(format!("{:.2} million points", points as f32 / 1e6)).small().color(pal.weak));
+                });
+            });
+        });
+
+        let mut ok = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            if primary(ui, "OK").clicked() {
+                ok = true;
+            }
+            if ui.add(egui::Button::new("Cancel").min_size(vec2(110.0, 28.0))).clicked() {
+                cancel = true;
+            }
+        });
+        ui.add_space(8.0);
+        if ok {
+            if let Some(before) = self.job_backup.take() {
+                let now = std::mem::replace(&mut self.doc.material, before);
+                self.push_undo();
+                self.doc.material = now;
+            }
+            self.apply_job();
+            self.form = None;
+        }
+        if cancel {
+            if let Some(before) = self.job_backup.take() {
+                self.doc.material = before;
+            }
+            self.form = None;
         }
     }
 }

@@ -11,6 +11,59 @@ use std::sync::Arc;
 pub enum Origin {
     BottomLeft,
     Center,
+    TopLeft,
+    TopRight,
+    BottomRight,
+}
+
+impl Origin {
+    /// Where this datum sits on a sheet `w` × `h` (job coordinates, Y up).
+    pub fn point(self, w: f32, h: f32) -> Pos2 {
+        match self {
+            Origin::BottomLeft => pos2(0.0, 0.0),
+            Origin::BottomRight => pos2(w, 0.0),
+            Origin::TopLeft => pos2(0.0, h),
+            Origin::TopRight => pos2(w, h),
+            Origin::Center => pos2(w * 0.5, h * 0.5),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::BottomLeft => "bottom-left corner",
+            Origin::BottomRight => "bottom-right corner",
+            Origin::TopLeft => "top-left corner",
+            Origin::TopRight => "top-right corner",
+            Origin::Center => "centre",
+        }
+    }
+}
+
+/// How finely the 3D model is sampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Resolution {
+    Standard,
+    #[default]
+    High,
+    Highest,
+}
+
+impl Resolution {
+    pub const ALL: [Resolution; 3] = [Resolution::Standard, Resolution::High, Resolution::Highest];
+    /// Cells along the longer side of the job.
+    pub fn cells(self) -> f32 {
+        match self {
+            Resolution::Standard => 384.0,
+            Resolution::High => 512.0,
+            Resolution::Highest => 768.0,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Resolution::Standard => "Standard (fastest)",
+            Resolution::High => "High",
+            Resolution::Highest => "Highest (slowest)",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +82,28 @@ pub struct Material {
     /// G-code output options.
     #[serde(default)]
     pub gcode: GcodeOpts,
+    /// Give the datum point these coordinates instead of 0,0.
+    #[serde(default)]
+    pub use_offset: bool,
+    #[serde(default)]
+    pub offset: [f32; 2],
+    /// Show the job setup in inches (everything is stored in mm).
+    #[serde(default)]
+    pub inches: bool,
+    #[serde(default)]
+    pub resolution: Resolution,
+}
+
+impl Material {
+    /// Where the machine's X0 Y0 is, in job coordinates.
+    pub fn xy_zero(&self) -> Pos2 {
+        let p = self.origin.point(self.w, self.h);
+        if self.use_offset {
+            pos2(p.x - self.offset[0], p.y - self.offset[1])
+        } else {
+            p
+        }
+    }
 }
 
 /// Options for writing G-code.
@@ -53,7 +128,7 @@ impl Default for GcodeOpts {
 
 impl Default for Material {
     fn default() -> Self {
-        Self { w: 300.0, h: 200.0, thickness: 20.0, origin: Origin::BottomLeft, safe_z: 5.0, z_bed: false, post: Post::default(), gcode: GcodeOpts::default() }
+        Self { w: 300.0, h: 200.0, thickness: 20.0, origin: Origin::BottomLeft, safe_z: 5.0, z_bed: false, post: Post::default(), gcode: GcodeOpts::default(), use_offset: false, offset: [0.0, 0.0], inches: false, resolution: Resolution::High }
     }
 }
 
@@ -740,10 +815,8 @@ pub fn gcode(paths: &[&Toolpath], mat: &Material) -> String {
     let inch = post.inch();
     let k = if inch { 1.0 / 25.4 } else { 1.0 };
     let dp = if inch { 4 } else { 3 };
-    let (ox, oy) = match mat.origin {
-        Origin::BottomLeft => (0.0, 0.0),
-        Origin::Center => (mat.w * 0.5, mat.h * 0.5),
-    };
+    let zero = mat.xy_zero();
+    let (ox, oy) = (zero.x, zero.y);
     // Z values are generated relative to the material top; shift them when Z zero is the bed.
     let oz = if mat.z_bed { mat.thickness } else { 0.0 };
     let n = |v: f32| {
@@ -797,10 +870,7 @@ pub fn gcode(paths: &[&Toolpath], mat: &Material) -> String {
     };
 
     emit(&mut out, &format!("( CarveCraft Studio · {} )", post.label()));
-    emit(&mut out, &format!("( Material {:.2} x {:.2} x {:.2} mm, Z zero on the {}, XY zero at the {} )", mat.w, mat.h, mat.thickness, if mat.z_bed { "machine bed" } else { "material surface" }, match mat.origin {
-        Origin::BottomLeft => "bottom-left corner",
-        Origin::Center => "centre",
-    }));
+    emit(&mut out, &format!("( Material {:.2} x {:.2} x {:.2} mm, Z zero on the {}, XY zero at the {} )", mat.w, mat.h, mat.thickness, if mat.z_bed { "machine bed" } else { "material surface" }, mat.origin.label()));
     for tp in paths {
         emit(&mut out, &format!("( {} – {} Ø{} mm, tool #{} )", tp.name, tp.tool.name, tp.tool.diameter, tp.tool.number));
     }
@@ -1235,5 +1305,29 @@ mod gcode_output_tests {
         assert!(r.deepest <= -mat.thickness - 2.0 + 1e-4);
         let (ok, mat) = job();
         assert!(check_gcode(&[&ok], &mat).warnings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod datum_tests {
+    use super::*;
+
+    #[test]
+    fn datum_and_offset_set_xy_zero() {
+        let mut m = Material::default(); // 300 × 200
+        assert_eq!(m.xy_zero(), pos2(0.0, 0.0));
+        m.origin = Origin::TopRight;
+        assert_eq!(m.xy_zero(), pos2(300.0, 200.0));
+        m.origin = Origin::Center;
+        assert_eq!(m.xy_zero(), pos2(150.0, 100.0));
+        // the datum corner gets coordinates (10, 5): machine zero is 10 left and 5 below it
+        m.origin = Origin::BottomLeft;
+        m.use_offset = true;
+        m.offset = [10.0, 5.0];
+        assert_eq!(m.xy_zero(), pos2(-10.0, -5.0));
+        // older job files without the new fields still open
+        let old = r#"{"w":100.0,"h":50.0,"thickness":12.0,"origin":"Center","safe_z":5.0}"#;
+        let o: Material = serde_json::from_str(old).unwrap();
+        assert_eq!((o.origin, o.resolution, o.inches), (Origin::Center, Resolution::High, false));
     }
 }

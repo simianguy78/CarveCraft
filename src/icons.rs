@@ -390,3 +390,75 @@ pub fn icon_tile(ui: &mut Ui, dark: bool, icon: &str, selected: bool, tip: &str)
     }
     resp.on_hover_text(tip)
 }
+
+/// A small wooden block, as in the original's Job Setup pictures.
+fn block(p: &Painter, base: Pos2, w: f32, d: f32, h: f32, top_col: Color32) -> [Pos2; 4] {
+    let wood = Color32::from_rgb(214, 170, 122);
+    let skew = vec2(d * 0.7, -d * 0.5);
+    let fl = base;
+    let fr = base + vec2(w, 0.0);
+    let top = [fl - vec2(0.0, h), fr - vec2(0.0, h), fr - vec2(0.0, h) + skew, fl - vec2(0.0, h) + skew];
+    p.add(Shape::convex_polygon(vec![fl, fr, top[1], top[0]], wood.gamma_multiply(0.82), Stroke::NONE));
+    p.add(Shape::convex_polygon(vec![fr, fr + skew, top[2], top[1]], wood.gamma_multiply(0.62), Stroke::NONE));
+    p.add(Shape::convex_polygon(top.to_vec(), top_col, Stroke::NONE));
+    top
+}
+
+/// Pictures for the Job Setup sections: "type", "size", "zzero" (on = machine bed),
+/// "datum", "resolution".
+pub fn job_art(p: &Painter, r: Rect, which: &str, on: bool) {
+    let wood = Color32::from_rgb(214, 170, 122);
+    let red = Color32::from_rgb(220, 60, 50);
+    let ink = Color32::from_rgb(120, 128, 140);
+    let s = Stroke::new(1.2_f32, ink);
+    let o = r.left_bottom() + vec2(4.0, -8.0);
+    match which {
+        "type" => {
+            // a block standing on a grey bed
+            p.add(Shape::convex_polygon(vec![o + vec2(-2.0, 4.0), o + vec2(38.0, 4.0), o + vec2(52.0, -6.0), o + vec2(12.0, -6.0)], Color32::from_rgb(170, 175, 182), Stroke::NONE));
+            block(p, o + vec2(4.0, -2.0), 30.0, 18.0, 20.0, wood);
+        }
+        "size" => {
+            let top = block(p, o + vec2(4.0, -6.0), 32.0, 20.0, 26.0, wood);
+            // dimension lines with X, Y and Z
+            let font = FontId::proportional(9.0);
+            p.line_segment([o + vec2(4.0, 0.0), o + vec2(36.0, 0.0)], s);
+            p.text(o + vec2(20.0, 2.0), Align2::CENTER_TOP, "X", font.clone(), ink);
+            p.line_segment([o + vec2(40.0, -8.0), o + vec2(53.0, -18.0)], s);
+            p.text(o + vec2(50.0, -10.0), Align2::LEFT_TOP, "Y", font.clone(), ink);
+            p.line_segment([top[2] + vec2(4.0, 0.0), top[2] + vec2(4.0, 26.0)], s);
+            p.text(top[2] + vec2(7.0, 10.0), Align2::LEFT_CENTER, "Z", font, ink);
+        }
+        "zzero" => {
+            let top = block(p, o + vec2(4.0, -2.0), 34.0, 20.0, 22.0, wood);
+            if on {
+                // red outline on the bed under the block
+                let b = o + vec2(4.0, -2.0);
+                let skew = vec2(14.0, -10.0);
+                p.add(Shape::closed_line(vec![b, b + vec2(34.0, 0.0), b + vec2(34.0, 0.0) + skew, b + skew], Stroke::new(2.0_f32, red)));
+            } else {
+                p.add(Shape::closed_line(top.to_vec(), Stroke::new(2.0_f32, red)));
+            }
+        }
+        "datum" => {
+            // a sheet seen at an angle with a red dot at the chosen corner
+            let sheet = [o + vec2(0.0, -2.0), o + vec2(32.0, -2.0), o + vec2(50.0, -20.0), o + vec2(18.0, -20.0)];
+            p.add(Shape::convex_polygon(sheet.to_vec(), wood, Stroke::NONE));
+            p.line_segment([sheet[0] + vec2(0.0, 3.0), sheet[1] + vec2(0.0, 3.0)], Stroke::new(3.0_f32, wood.gamma_multiply(0.7)));
+            p.circle_filled(sheet[0], 4.0, red);
+        }
+        _ => {
+            // resolution: a coarse stair next to a fine slope
+            for k in 0..5 {
+                let x = o.x + 2.0 + k as f32 * 5.0;
+                let h = 6.0 + k as f32 * 5.0;
+                p.rect_filled(Rect::from_min_max(pos2(x, o.y - h), pos2(x + 5.0, o.y)), 0.0, wood.gamma_multiply(0.6 + 0.08 * k as f32));
+            }
+            let fine: Vec<Pos2> = (0..=24).map(|k| o + vec2(30.0 + k as f32, -(6.0 + k as f32))).collect();
+            let mut poly = fine.clone();
+            poly.push(o + vec2(54.0, 0.0));
+            poly.push(o + vec2(30.0, 0.0));
+            p.add(Shape::convex_polygon(poly, wood, Stroke::NONE));
+        }
+    }
+}

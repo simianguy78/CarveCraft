@@ -176,7 +176,11 @@ pub struct Grid {
 
 impl Grid {
     pub fn for_material(w: f32, h: f32) -> Grid {
-        let cell = (w.max(h) / 512.0).max(0.05);
+        Self::for_material_cells(w, h, 512.0)
+    }
+    /// A grid with about `cells` cells along the job's longer side.
+    pub fn for_material_cells(w: f32, h: f32, cells: f32) -> Grid {
+        let cell = (w.max(h) / cells).max(0.05);
         Grid { nx: (w / cell).round().max(2.0) as usize, ny: (h / cell).round().max(2.0) as usize, cell }
     }
     pub fn pos(&self, i: usize, j: usize) -> Pos2 {
@@ -205,7 +209,12 @@ impl Model {
     }
 
     pub fn resize(&mut self, w: f32, h: f32) {
-        let grid = Grid::for_material(w, h);
+        self.resize_cells(w, h, 512.0);
+    }
+
+    /// Resample to a new job size or resolution (the sculpt layer starts fresh).
+    pub fn resize_cells(&mut self, w: f32, h: f32, cells: f32) {
+        let grid = Grid::for_material_cells(w, h, cells);
         if grid != self.grid {
             self.grid = grid;
             self.sculpt = vec![0.0; grid.len()];
