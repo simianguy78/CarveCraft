@@ -7,6 +7,19 @@ use crate::theme::{self, ACCENT};
 use crate::toolpath::ToolKind;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Mesh, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui};
 
+fn shift_only(resp: &egui::Response) -> bool {
+    resp.ctx.input(|i| i.modifiers.shift)
+}
+
+/// Inside angle at `v` between the segments to `a` and to `b`, in degrees (0–180).
+fn corner_angle(a: Pos2, v: Pos2, b: Pos2) -> Option<f32> {
+    let (u, w) = (a - v, b - v);
+    if u.length() < 1e-6 || w.length() < 1e-6 {
+        return None;
+    }
+    Some((u.dot(w) / (u.length() * w.length())).clamp(-1.0, 1.0).acos().to_degrees())
+}
+
 /// Scale a shape by `sx`/`sy` along the job axes about `anchor`.
 fn scale_vector(v0: &Vector, anchor: Pos2, sx: f32, sy: f32) -> Vector {
     let mut v = v0.clone();
@@ -121,6 +134,11 @@ impl App {
 
         // --- interaction
         self.handle_2d_input(&resp, to_j, tol);
+        // Screen spots of the top-right rotate handle and the selection centre, for the
+        // scripted drag used when checking this feature.
+        self.probe = self.selection_handles().and_then(|(b, hs)| {
+            hs.iter().filter(|(h, _)| *h == Handle::Rotate).max_by(|a, b| (a.1.x + a.1.y).total_cmp(&(b.1.x + b.1.y))).map(|(_, q)| (to_s(*q), to_s(b.center())))
+        });
 
         // --- drawing
         let mr = Rect::from_two_pos(to_s(pos2(0.0, 0.0)), to_s(pos2(mat.w, mat.h)));
@@ -297,13 +315,67 @@ impl App {
                 }
             }
         } else if !self.poly_pts.is_empty() {
-            let mut pts: Vec<Pos2> = self.poly_pts.iter().map(|p| to_s(*p)).collect();
-            if let Some(h) = hover_j {
-                pts.push(to_s(self.snap_pt(h)));
+            let shift = ui.input(|i| i.modifiers.shift);
+            let next = if self.tool == DrawTool::Polyline { hover_j.map(|h| self.polyline_next(h, shift)) } else { hover_j.map(|h| (self.snap_pt(h), false)) };
+            let closing = next.is_some_and(|(_, c)| c);
+            let close_col = Color32::from_rgb(52, 199, 120);
+            let mut job: Vec<Pos2> = self.poly_pts.clone();
+            if let Some((p, _)) = next {
+                job.push(p);
             }
-            painter.add(Shape::line(pts.clone(), preview));
-            for p in &pts[..self.poly_pts.len()] {
-                painter.circle_filled(*p, 3.5, ACCENT);
+            let pts: Vec<Pos2> = job.iter().map(|p| to_s(*p)).collect();
+            painter.add(Shape::line(pts.clone(), if closing { Stroke::new(2.0_f32, close_col) } else { preview }));
+            let tag = |at: Pos2, text: String, col: Color32| {
+                let g = painter.layout_no_wrap(text, FontId::proportional(11.0), Color32::WHITE);
+                let r = Rect::from_center_size(at, g.size() + vec2(8.0, 4.0));
+                painter.rect_filled(r, CornerRadius::same(4), col.gamma_multiply(0.9));
+                painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
+            };
+            // Length of every segment, the live one included, on a small pill at its middle.
+            for w in job.windows(2) {
+                let len = (w[1] - w[0]).length();
+                if len < 1e-3 {
+                    continue;
+                }
+                let (a, b) = (to_s(w[0]), to_s(w[1]));
+                let n = (b - a).normalized().rot90() * 12.0;
+                tag(a + (b - a) * 0.5 - n, format!("{len:.1} mm"), ACCENT);
+            }
+            // Corner angle at each clicked point that has segments on both sides.
+            for i in 1..job.len().saturating_sub(1) {
+                if let Some(deg) = corner_angle(job[i - 1], job[i], job[i + 1]) {
+                    let (a, v, b) = (to_s(job[i - 1]), to_s(job[i]), to_s(job[i + 1]));
+                    // Put the label inside the corner, along the bisector.
+                    let bis = ((a - v).normalized() + (b - v).normalized()).normalized();
+                    let bis = if bis.x.is_nan() { vec2(0.0, -1.0) } else { bis };
+                    let r = 16.0;
+                    let a0 = (a - v).angle();
+                    let mut sweep = (b - v).angle() - a0;
+                    while sweep > std::f32::consts::PI {
+                        sweep -= std::f32::consts::TAU;
+                    }
+                    while sweep < -std::f32::consts::PI {
+                        sweep += std::f32::consts::TAU;
+                    }
+                    let arc: Vec<Pos2> = (0..=12).map(|k| v + vec2((a0 + sweep * k as f32 / 12.0).cos(), (a0 + sweep * k as f32 / 12.0).sin()) * r).collect();
+                    painter.add(Shape::line(arc, Stroke::new(1.0_f32, Color32::from_rgb(255, 184, 77))));
+                    tag(v + bis * 34.0, format!("{deg:.0}°"), Color32::from_rgb(214, 140, 30));
+                }
+            }
+            for (i, p) in pts[..self.poly_pts.len()].iter().enumerate() {
+                if i == 0 && closing {
+                    // The start point lights up to show the next click closes the shape.
+                    painter.circle_filled(*p, 7.0, close_col);
+                    painter.circle_stroke(*p, 10.0, Stroke::new(1.5_f32, close_col));
+                } else if i == 0 && self.poly_pts.len() >= 3 && self.tool == DrawTool::Polyline {
+                    painter.circle_stroke(*p, 6.0, Stroke::new(1.5_f32, ACCENT));
+                    painter.circle_filled(*p, 3.5, ACCENT);
+                } else {
+                    painter.circle_filled(*p, 3.5, ACCENT);
+                }
+            }
+            if closing {
+                tag(pts[0] + vec2(0.0, -24.0), "Click to close".into(), close_col);
             }
         }
         if self.tool == DrawTool::Sculpt {
@@ -372,7 +444,7 @@ impl App {
             DrawTool::Select => "Click or box-select · drag to move · corner squares scale (Shift = free), edge squares stretch · round dots rotate (Shift = 15°)",
             DrawTool::Rect | DrawTool::Ellipse => "Drag to draw · Esc returns to Select",
             DrawTool::Circle | DrawTool::Polygon | DrawTool::Star => "Drag out from the centre · Esc returns to Select",
-            DrawTool::Polyline => "Click to add points · click the first point to close · double-click or Enter to finish",
+            DrawTool::Polyline => "Click to add points · Shift locks to 45°/90° · click the green start point to close · double-click or Enter to finish",
             DrawTool::Freehand => "Drag to sketch · finish near the start to close the shape",
             DrawTool::Text => "Click where the text should go",
             DrawTool::Arc => "Click the start, then the end, then a point the arc passes through",
@@ -491,10 +563,43 @@ impl App {
         Some((b, out))
     }
 
+    /// Where the next polyline point goes for a pointer at `raw`, and whether it closes the
+    /// shape: it snaps onto the first point when near it, and with Shift the new segment is
+    /// locked to 45° steps (which includes 90°).
+    pub fn polyline_next(&self, raw: Pos2, shift: bool) -> (Pos2, bool) {
+        let pts = &self.poly_pts;
+        let z = self.v2_zoom.max(1e-3);
+        if pts.len() >= 3 && (pts[0] - raw).length() <= 12.0 / z {
+            return (pts[0], true);
+        }
+        if let (true, Some(last)) = (shift, pts.last()) {
+            let d = raw - *last;
+            let a = (d.y.atan2(d.x) / std::f32::consts::FRAC_PI_4).round() * std::f32::consts::FRAC_PI_4;
+            let len = d.length();
+            // A snapped length too, when the grid snap is on.
+            let len = if self.snap { (len / 5.0).round() * 5.0 } else { len };
+            return (*last + vec2(a.cos(), a.sin()) * len, false);
+        }
+        (self.snap_pt(raw), false)
+    }
+
     fn handle_at(&self, p: Pos2) -> Option<Handle> {
-        let (_, hs) = self.selection_handles()?;
-        let reach = 7.0 / self.v2_zoom.max(1e-3);
-        hs.into_iter().filter(|(_, q)| (*q - p).length() <= reach).min_by(|a, b| (a.1 - p).length().total_cmp(&(b.1 - p).length())).map(|(h, _)| h)
+        let (b, hs) = self.selection_handles()?;
+        let z = self.v2_zoom.max(1e-3);
+        // Scale squares win when the pointer is right on them.
+        let reach = 9.0 / z;
+        let scale = hs
+            .iter()
+            .filter(|(h, q)| matches!(h, Handle::Scale(..)) && (*q - p).length() <= reach)
+            .min_by(|a, c| (a.1 - p).length().total_cmp(&(c.1 - p).length()))
+            .map(|(h, _)| *h);
+        if scale.is_some() {
+            return scale;
+        }
+        // Rotate anywhere in a generous zone just outside each corner of the box.
+        let r = b.expand(5.0 / z);
+        let near_corner = [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()].iter().any(|c| (*c - p).length() <= 42.0 / z);
+        (near_corner && !r.contains(p)).then_some(Handle::Rotate)
     }
 
     fn handle_2d_input(&mut self, resp: &egui::Response, to_j: impl Fn(Pos2) -> Pos2, tol: f32) {
@@ -590,7 +695,8 @@ impl App {
                     }
                     self.drag = Drag::None;
                 }
-                if resp.clicked() {
+                // A click on a handle keeps the selection rather than clearing it.
+                if resp.clicked() && !pos.is_some_and(|p| self.handle_at(p).is_some()) {
                     if let Some(p) = pos {
                         match self.hit_vector(p, tol) {
                             Some(id) => {
@@ -657,13 +763,16 @@ impl App {
                 }
             }
             DrawTool::Polyline => {
-                if resp.double_clicked() {
+                // A double-click finishes only when both clicks land on the same spot;
+                // quick clicks in different places keep adding points.
+                let same_spot = pos.zip(self.poly_pts.last().copied()).is_some_and(|(p, last)| (p - last).length() <= tol * 1.5);
+                if resp.double_clicked() && same_spot {
                     self.poly_pts.pop();
                     self.finish_polyline(false);
                 } else if resp.clicked() {
                     if let Some(p) = pos {
-                        let p = self.snap_pt(p);
-                        if self.poly_pts.len() >= 3 && (self.poly_pts[0] - p).length() < tol * 1.5 {
+                        let (p, closes) = self.polyline_next(p, shift_only(resp));
+                        if closes {
                             self.finish_polyline(true);
                         } else {
                             self.poly_pts.push(p);
@@ -1005,5 +1114,19 @@ mod handle_tests {
         let nb = s.bounds();
         assert!(matches!(s.kind, ShapeKind::Path { .. }));
         assert!((nb.width() - b.width() * 1.5).abs() < 1e-2 && (nb.height() - b.height()).abs() < 1e-2);
+    }
+}
+
+#[cfg(test)]
+mod polyline_tests {
+    use super::*;
+
+    #[test]
+    fn corner_angles() {
+        let a = corner_angle(pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0)).unwrap();
+        assert!((a - 90.0).abs() < 1e-3);
+        let b = corner_angle(pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(20.0, 0.0)).unwrap();
+        assert!((b - 180.0).abs() < 1e-3);
+        assert!(corner_angle(pos2(1.0, 1.0), pos2(1.0, 1.0), pos2(2.0, 2.0)).is_none());
     }
 }

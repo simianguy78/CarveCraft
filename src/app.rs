@@ -231,6 +231,12 @@ pub struct App {
     pub sim_running: bool,
     pub sim_speed: f32,
     pub show_tool_db: bool,
+    /// Screen positions of a rotate handle and the selection centre (for scripted checks).
+    pub probe: Option<(Pos2, Pos2)>,
+    /// A scripted rotate drag runs during the screenshot (CARVECRAFT_START=rotate).
+    pub script_rotate: bool,
+    pub script_poly: bool,
+    script_start: Option<(Pos2, Pos2)>,
     pub sel_comp: Option<usize>,
     pub sel_tp: Option<usize>,
     pub dark: bool,
@@ -285,6 +291,10 @@ impl App {
             sim_running: false,
             sim_speed: 3.2,
             show_tool_db: false,
+            probe: None,
+            script_rotate: false,
+            script_poly: false,
+            script_start: None,
             sel_comp: Some(3),
             sel_tp: None,
             dark: true,
@@ -314,6 +324,11 @@ impl App {
                 "2d" => app.view = View::D2,
                 "design" => app.left_tab = LeftTab::Design,
                 "light" => app.dark = false,
+                "rotate" => app.script_rotate = true,
+                "poly" => {
+                    app.script_poly = true;
+                    app.tool = DrawTool::Polyline;
+                }
                 "sim" => app.start_sim(false),
                 "select" => app.sel = app.doc.vectors.iter().skip(3).take(1).map(|v| v.id).collect(),
                 _ => {}
@@ -950,7 +965,71 @@ impl App {
     }
 }
 
+impl App {
+    /// Feed a mouse drag around the selection centre, starting on a rotate handle.
+    fn scripted_rotate(&mut self, raw: &mut egui::RawInput) {
+        let f = self.frames;
+        if f == 40 {
+            self.script_start = self.probe;
+        }
+        let Some((h0, c)) = self.script_start else { return };
+        // Grab a little off the dot, like a real hand would.
+        let h = h0 + vec2(7.0, -6.0);
+        let at = |deg: f32| {
+            let d = h - c;
+            let (s, co) = (-deg).to_radians().sin_cos();
+            c + vec2(d.x * co - d.y * s, d.x * s + d.y * co)
+        };
+        let ev = &mut raw.events;
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        match f {
+            40..=41 => ev.push(egui::Event::PointerMoved(h)),
+            // a plain click on the handle first: it must not lose the selection
+            42 => ev.push(button(h, true)),
+            43 => ev.push(button(h, false)),
+            44..=49 => {}
+            50 => ev.push(button(h, true)),
+            51..=58 => {} // hold still a moment before moving
+            59..=89 => ev.push(egui::Event::PointerMoved(at((f - 59) as f32 * 1.5))),
+            90 => ev.push(button(at(45.0), false)),
+            _ => {}
+        }
+    }
+}
+
+impl App {
+    /// Click three polyline points, then hover by the start point (it should offer to close).
+    fn scripted_polyline(&mut self, raw: &mut egui::RawInput) {
+        let f = self.frames;
+        let pts = [pos2(560.0, 700.0), pos2(900.0, 700.0), pos2(900.0, 430.0)];
+        let ev = &mut raw.events;
+        let click = |ev: &mut Vec<egui::Event>, p: Pos2, pressed| ev.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        for (k, p) in pts.iter().enumerate() {
+            let base = 30 + k as u32 * 12;
+            if f == base {
+                ev.push(egui::Event::PointerMoved(*p));
+            } else if f == base + 1 {
+                click(ev, *p, true);
+            } else if f == base + 2 {
+                click(ev, *p, false);
+            }
+        }
+        if (70..200).contains(&f) {
+            ev.push(egui::Event::PointerMoved(pts[0] + vec2(6.0, -5.0)));
+        }
+    }
+}
+
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.script_rotate {
+            self.scripted_rotate(raw);
+        }
+        if self.script_poly {
+            self.scripted_polyline(raw);
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.applied_dark != Some(self.dark) {
             theme::apply(ctx, self.dark);
