@@ -25,6 +25,9 @@ pub struct Doc {
     pub model: Model,
     pub toolpaths: Vec<Toolpath>,
     pub next_id: u64,
+    /// Sketch constraints on shapes' points (horizontal, vertical, parallel, fixed…).
+    #[serde(default)]
+    pub constraints: Vec<geom::ShapeConstraint>,
 }
 
 impl Doc {
@@ -38,6 +41,7 @@ impl Doc {
             model,
             toolpaths: Vec::new(),
             next_id: 1,
+            constraints: Vec::new(),
         }
     }
     pub fn id(&mut self) -> u64 {
@@ -235,14 +239,16 @@ pub struct App {
     /// Node editing: the picked node (shape id, index), corners with a locked angle,
     /// the segment length being typed, and where last frame's length labels were drawn.
     pub node_sel: Option<(u64, usize)>,
-    pub node_locks: Vec<(u64, usize)>,
     pub len_edit: Option<(u64, usize, String)>,
     pub node_len_tags: Vec<(Rect, u64, usize)>,
+    /// Lines picked in node edit (shape id, segment index), for constraints.
+    pub seg_sel: Vec<(u64, usize)>,
     /// Screen positions of the nodes being edited (for scripted checks).
     pub node_probe: Vec<Pos2>,
     /// Show length and angle labels while drawing and node editing.
     pub show_dims: bool,
     pub script_node: bool,
+    pub script_cons: bool,
     /// Screen positions of a rotate handle and the selection centre (for scripted checks).
     pub probe: Option<(Pos2, Pos2)>,
     /// A scripted rotate drag runs during the screenshot (CARVECRAFT_START=rotate).
@@ -304,12 +310,13 @@ impl App {
             sim_speed: 3.2,
             show_tool_db: false,
             node_sel: None,
-            node_locks: Vec::new(),
             len_edit: None,
             node_len_tags: Vec::new(),
+            seg_sel: Vec::new(),
             node_probe: Vec::new(),
             show_dims: true,
             script_node: false,
+            script_cons: false,
             probe: None,
             script_rotate: false,
             script_poly: false,
@@ -348,6 +355,17 @@ impl App {
                     // Node-edit the rounded plaque outline: lots of short segments.
                     app.tool = DrawTool::Node;
                     app.sel = app.doc.vectors.iter().take(1).map(|v| v.id).collect();
+                }
+                "cons" => {
+                    // A slanted four-sided shape with a few sketch constraints applied.
+                    app.script_cons = true;
+                    app.tool = DrawTool::Node;
+                    let pts = vec![pos2(60.0, 150.0), pos2(140.0, 158.0), pos2(150.0, 90.0), pos2(70.0, 70.0)];
+                    let id = app.add_path(pts, true);
+                    app.sel = vec![id];
+                    app.add_constraint(id, crate::geom::Constraint::Horizontal(0));
+                    app.add_constraint(id, crate::geom::Constraint::Fixed(1));
+                    app.add_constraint(id, crate::geom::Constraint::Parallel(1, 3));
                 }
                 "node" => {
                     // A simple four-sided shape to node-edit.
@@ -1030,6 +1048,34 @@ impl App {
 }
 
 impl App {
+    /// Click the middle of line 1, then Shift-click the middle of line 3.
+    fn scripted_lines(&mut self, raw: &mut egui::RawInput) {
+        let f = self.frames;
+        let q = &self.node_probe;
+        if q.len() < 4 {
+            return;
+        }
+        let mid = |a: usize, b: usize| q[a] + (q[b] - q[a]) * 0.5;
+        let (l1, l3) = (mid(0, 1), mid(2, 3));
+        let ev = &mut raw.events;
+        let click = |ev: &mut Vec<egui::Event>, p: Pos2, down, shift: bool| {
+            let modifiers = if shift { egui::Modifiers::SHIFT } else { Default::default() };
+            ev.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: down, modifiers });
+        };
+        match f {
+            30 => ev.push(egui::Event::PointerMoved(l1)),
+            31 => click(ev, l1, true, false),
+            32 => click(ev, l1, false, false),
+            60 => ev.push(egui::Event::PointerMoved(l3)),
+            61 => click(ev, l3, true, true),
+            62 => click(ev, l3, false, true),
+            _ => {}
+        }
+        if f >= 61 {
+            raw.modifiers = egui::Modifiers::SHIFT;
+        }
+    }
+
     /// Pick the second node, then double-click the first length label and type 100.
     fn scripted_node(&mut self, raw: &mut egui::RawInput) {
         let f = self.frames;
@@ -1095,6 +1141,9 @@ impl eframe::App for App {
         }
         if self.script_node {
             self.scripted_node(raw);
+        }
+        if self.script_cons {
+            self.scripted_lines(raw);
         }
     }
 

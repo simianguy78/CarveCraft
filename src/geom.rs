@@ -821,3 +821,367 @@ mod edit_tests {
         assert!(all.len() > 20);
     }
 }
+
+// ------------------------------------------------------------ sketch constraints
+
+/// A geometric rule on a shape's points, kept true while editing (like a CAD sketch).
+/// Segment `k` runs from point `k` to point `k + 1` (wrapping on closed shapes).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Constraint {
+    Horizontal(usize),
+    Vertical(usize),
+    Parallel(usize, usize),
+    Perpendicular(usize, usize),
+    Fixed(usize),
+    /// The inside corner angle at a point, in degrees.
+    Angle(usize, f32),
+}
+
+impl Constraint {
+    pub fn label(&self) -> String {
+        match self {
+            Constraint::Horizontal(k) => format!("Horizontal · line {}", k + 1),
+            Constraint::Vertical(k) => format!("Vertical · line {}", k + 1),
+            Constraint::Parallel(a, b) => format!("Parallel · lines {} and {}", a + 1, b + 1),
+            Constraint::Perpendicular(a, b) => format!("Perpendicular · lines {} and {}", a + 1, b + 1),
+            Constraint::Fixed(i) => format!("Fixed · point {}", i + 1),
+            Constraint::Angle(i, d) => format!("Angle {d:.1}° · point {}", i + 1),
+        }
+    }
+    pub fn segments(&self) -> Vec<usize> {
+        match *self {
+            Constraint::Horizontal(k) | Constraint::Vertical(k) => vec![k],
+            Constraint::Parallel(a, b) | Constraint::Perpendicular(a, b) => vec![a, b],
+            Constraint::Fixed(_) | Constraint::Angle(..) => vec![],
+        }
+    }
+    pub fn point(&self) -> Option<usize> {
+        match *self {
+            Constraint::Fixed(i) => Some(i),
+            _ => None,
+        }
+    }
+    /// The same rule after a point is inserted at `at` (segment `at - 1` is split in two).
+    pub fn after_insert(&self, at: usize) -> Option<Constraint> {
+        let p = |i: usize| if i >= at { i + 1 } else { i };
+        let s = |k: usize| if k + 1 == at { None } else if k >= at { Some(k + 1) } else { Some(k) };
+        Some(match *self {
+            Constraint::Horizontal(k) => Constraint::Horizontal(s(k)?),
+            Constraint::Vertical(k) => Constraint::Vertical(s(k)?),
+            Constraint::Parallel(a, b) => Constraint::Parallel(s(a)?, s(b)?),
+            Constraint::Perpendicular(a, b) => Constraint::Perpendicular(s(a)?, s(b)?),
+            Constraint::Fixed(i) => Constraint::Fixed(p(i)),
+            // a new point right next to the corner changes which lines meet there
+            Constraint::Angle(i, d) => {
+                if at == i || at == i + 1 {
+                    return None;
+                }
+                Constraint::Angle(p(i), d)
+            }
+        })
+    }
+    /// The same rule after point `at` is removed (its two segments merge), if it still applies.
+    pub fn after_remove(&self, at: usize, n_before: usize, closed: bool) -> Option<Constraint> {
+        let p = |i: usize| if i == at { None } else if i > at { Some(i - 1) } else { Some(i) };
+        let before = if at > 0 { Some(at - 1) } else if closed { Some(n_before - 1) } else { None };
+        let s = |k: usize| if k == at || Some(k) == before { None } else if k > at { Some(k - 1) } else { Some(k) };
+        Some(match *self {
+            Constraint::Horizontal(k) => Constraint::Horizontal(s(k)?),
+            Constraint::Vertical(k) => Constraint::Vertical(s(k)?),
+            Constraint::Parallel(a, b) => Constraint::Parallel(s(a)?, s(b)?),
+            Constraint::Perpendicular(a, b) => Constraint::Perpendicular(s(a)?, s(b)?),
+            Constraint::Fixed(i) => Constraint::Fixed(p(i)?),
+            Constraint::Angle(i, d) => {
+                let (pv, nx) = corner_neighbours(n_before, closed, i);
+                if Some(at) == pv || Some(at) == nx {
+                    return None;
+                }
+                Constraint::Angle(p(i)?, d)
+            }
+        })
+    }
+}
+
+/// A constraint attached to one shape.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShapeConstraint {
+    pub shape: u64,
+    pub c: Constraint,
+}
+
+/// Move points so the constraints hold, changing them as little as possible.
+///
+/// Like a CAD sketch solver (the approach SolidCraft describes): every constraint gives a
+/// residual in millimetres that is zero when it holds, and a damped Gauss–Newton iteration
+/// drives them all to zero together. Each step is the smallest change of the points that
+/// fixes the residuals (minimum-norm), so loosely constrained shapes move as little as
+/// possible. Points in `pinned` (the one being dragged) and fixed points stay put. When the
+/// constraints can't all hold, nothing moves and `false` comes back.
+pub fn solve_constraints(pts: &mut [Pos2], closed: bool, cons: &[Constraint], pinned: &[usize]) -> bool {
+    let n = pts.len();
+    if n < 2 || cons.is_empty() {
+        return true;
+    }
+    let segs = if closed { n } else { n - 1 };
+    let ends = |k: usize| (k % n, (k + 1) % n);
+    let fixed: Vec<usize> = cons.iter().filter_map(|c| c.point()).collect();
+    // Only points some constraint touches are unknowns; the rest stay where they are.
+    let mut touched: Vec<usize> = Vec::new();
+    for c in cons {
+        for k in c.segments() {
+            if k < segs {
+                let (a, b) = ends(k);
+                touched.extend([a, b]);
+            }
+        }
+        if let Constraint::Angle(i, _) = c {
+            if let (Some(p), Some(q)) = corner_neighbours(n, closed, *i) {
+                touched.extend([p, *i, q]);
+            }
+        }
+    }
+    touched.sort_unstable();
+    touched.dedup();
+    let vars: Vec<usize> = touched.into_iter().filter(|i| !pinned.contains(i) && !fixed.contains(i)).collect();
+    let start: Vec<Pos2> = pts.to_vec();
+    let residuals = |p: &[Pos2]| -> Vec<f64> {
+        let mut r = Vec::new();
+        let d = |k: usize| {
+            let (a, b) = ends(k);
+            p[b] - p[a]
+        };
+        for c in cons {
+            match *c {
+                Constraint::Horizontal(k) if k < segs => r.push(d(k).y as f64),
+                Constraint::Vertical(k) if k < segs => r.push(d(k).x as f64),
+                Constraint::Parallel(a, b) if a < segs && b < segs => {
+                    let (u, w) = (d(a), d(b));
+                    r.push(((u.x * w.y - u.y * w.x) / u.length().max(1e-6)) as f64);
+                }
+                Constraint::Perpendicular(a, b) if a < segs && b < segs => {
+                    let (u, w) = (d(a), d(b));
+                    r.push((u.dot(w) / u.length().max(1e-6)) as f64);
+                }
+                Constraint::Angle(i, deg) => {
+                    if let (Some(pv), Some(nx)) = corner_neighbours(n, closed, i) {
+                        let (u, w) = (p[pv] - p[i], p[nx] - p[i]);
+                        let ang = (u.x * w.y - u.y * w.x).abs().atan2(u.dot(w));
+                        let scale = u.length().min(w.length()).max(1e-3);
+                        r.push(((ang - deg.to_radians()) * scale) as f64);
+                    }
+                }
+                _ => {}
+            }
+        }
+        r
+    };
+    if vars.is_empty() {
+        return residuals(pts).iter().all(|v| v.abs() < 1e-4);
+    }
+    let m = residuals(pts).len();
+    let nv = vars.len() * 2;
+    let read = |p: &[Pos2]| -> Vec<f64> { vars.iter().flat_map(|&i| [p[i].x as f64, p[i].y as f64]).collect() };
+    let write = |p: &mut [Pos2], x: &[f64]| {
+        for (k, &i) in vars.iter().enumerate() {
+            p[i] = pos2(x[2 * k] as f32, x[2 * k + 1] as f32);
+        }
+    };
+    let cost = |r: &[f64]| r.iter().map(|v| v * v).sum::<f64>();
+    let mut x = read(pts);
+    let mut r = residuals(pts);
+    let mut mu = 1e-6;
+    for _ in 0..80 {
+        if r.iter().all(|v| v.abs() < 1e-7) {
+            break;
+        }
+        // Jacobian by central differences.
+        let mut jac = vec![0.0f64; m * nv];
+        let mut probe = pts.to_vec();
+        for j in 0..nv {
+            let h = 1e-4;
+            let mut xp = x.clone();
+            xp[j] += h;
+            write(&mut probe, &xp);
+            let rp = residuals(&probe);
+            xp[j] -= 2.0 * h;
+            write(&mut probe, &xp);
+            let rm = residuals(&probe);
+            for i in 0..m {
+                jac[i * nv + j] = (rp[i] - rm[i]) / (2.0 * h);
+            }
+        }
+        // Minimum-norm damped step: (J Jᵀ + μI) y = -r, step = Jᵀ y.
+        let mut a = vec![0.0f64; m * m];
+        for i in 0..m {
+            for k in 0..m {
+                a[i * m + k] = (0..nv).map(|j| jac[i * nv + j] * jac[k * nv + j]).sum::<f64>() + if i == k { mu } else { 0.0 };
+            }
+        }
+        let rhs: Vec<f64> = r.iter().map(|v| -v).collect();
+        let Some(y) = solve_dense(&mut a, rhs, m) else { break };
+        let step: Vec<f64> = (0..nv).map(|j| (0..m).map(|i| jac[i * nv + j] * y[i]).sum()).collect();
+        let xt: Vec<f64> = x.iter().zip(&step).map(|(a, b)| a + b).collect();
+        write(pts, &xt);
+        let rt = residuals(pts);
+        if cost(&rt) < cost(&r) {
+            x = xt;
+            r = rt;
+            mu = (mu * 0.3).max(1e-12);
+        } else {
+            write(pts, &x);
+            mu *= 10.0;
+            if mu > 1e6 {
+                break;
+            }
+        }
+    }
+    let ok = r.iter().all(|v| v.abs() < 1e-3);
+    if !ok {
+        pts.copy_from_slice(&start);
+    }
+    ok
+}
+
+/// The points before and after point `i` on a shape of `n` points.
+pub fn corner_neighbours(n: usize, closed: bool, i: usize) -> (Option<usize>, Option<usize>) {
+    let prev = if i > 0 { Some(i - 1) } else if closed && n > 2 { Some(n - 1) } else { None };
+    let next = if i + 1 < n { Some(i + 1) } else if closed && n > 2 { Some(0) } else { None };
+    (prev, next)
+}
+
+/// Solve the square system `a · x = b` (row-major `n × n`) by elimination with pivoting.
+fn solve_dense(a: &mut [f64], mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+    for col in 0..n {
+        let piv = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs()))?;
+        if a[piv * n + col].abs() < 1e-14 {
+            return None;
+        }
+        if piv != col {
+            for k in 0..n {
+                a.swap(piv * n + k, col * n + k);
+            }
+            b.swap(piv, col);
+        }
+        for row in col + 1..n {
+            let f = a[row * n + col] / a[col * n + col];
+            if f != 0.0 {
+                for k in col..n {
+                    a[row * n + k] -= f * a[col * n + k];
+                }
+                b[row] -= f * b[col];
+            }
+        }
+    }
+    let mut x = vec![0.0; n];
+    for row in (0..n).rev() {
+        let s: f64 = (row + 1..n).map(|k| a[row * n + k] * x[k]).sum();
+        x[row] = (b[row] - s) / a[row * n + row];
+    }
+    Some(x)
+}
+
+/// The constraint a line (or a pair of lines) nearly has already: horizontal or vertical for
+/// one line, parallel or perpendicular for two (SolidCraft's "Sketch Constrainer" idea).
+pub fn infer_constraint(pts: &[Pos2], lines: &[usize]) -> Option<Constraint> {
+    let n = pts.len();
+    let d = |k: usize| pts[(k + 1) % n] - pts[k % n];
+    match lines {
+        [k] => {
+            let v = d(*k);
+            Some(if v.x.abs() >= v.y.abs() { Constraint::Horizontal(*k) } else { Constraint::Vertical(*k) })
+        }
+        [a, b] => {
+            let (u, w) = (d(*a), d(*b));
+            let cos = (u.dot(w) / (u.length() * w.length()).max(1e-9)).abs();
+            Some(if cos >= std::f32::consts::FRAC_1_SQRT_2 { Constraint::Parallel(*a, *b) } else { Constraint::Perpendicular(*a, *b) })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod constraint_tests {
+    use super::*;
+
+    fn quad() -> Vec<Pos2> {
+        vec![pos2(0.0, 0.0), pos2(10.0, 1.0), pos2(11.0, 9.0), pos2(-1.0, 10.0)]
+    }
+
+    #[test]
+    fn horizontal_and_vertical() {
+        let mut p = quad();
+        solve_constraints(&mut p, true, &[Constraint::Horizontal(0), Constraint::Vertical(1)], &[]);
+        assert!((p[0].y - p[1].y).abs() < 1e-3);
+        assert!((p[1].x - p[2].x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fixed_point_never_moves() {
+        let mut p = quad();
+        let before = p[1];
+        solve_constraints(&mut p, true, &[Constraint::Fixed(1), Constraint::Horizontal(0), Constraint::Vertical(1)], &[]);
+        assert_eq!(p[1], before);
+        assert!((p[0].y - p[1].y).abs() < 1e-3 && (p[2].x - p[1].x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn parallel_and_perpendicular() {
+        let mut p = quad();
+        solve_constraints(&mut p, true, &[Constraint::Parallel(0, 2)], &[]);
+        let (d0, d2) = (p[1] - p[0], p[3] - p[2]);
+        assert!((d0.x * d2.y - d0.y * d2.x).abs() / (d0.length() * d2.length()) < 1e-3);
+        let mut q = quad();
+        solve_constraints(&mut q, true, &[Constraint::Perpendicular(0, 1)], &[]);
+        let (e0, e1) = (q[1] - q[0], q[2] - q[1]);
+        assert!(e0.dot(e1).abs() / (e0.length() * e1.length()) < 1e-3);
+    }
+
+    #[test]
+    fn pinned_point_holds_while_others_follow() {
+        let mut p = quad();
+        p[1] = pos2(10.0, 5.0); // dragged
+        solve_constraints(&mut p, true, &[Constraint::Horizontal(0)], &[1]);
+        assert_eq!(p[1], pos2(10.0, 5.0));
+        assert!((p[0].y - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn angle_constraint_and_conflicts() {
+        let mut p = quad();
+        assert!(solve_constraints(&mut p, true, &[Constraint::Angle(1, 90.0)], &[]));
+        let (u, w) = (p[0] - p[1], p[2] - p[1]);
+        assert!(u.dot(w).abs() / (u.length() * w.length()) < 1e-3);
+        // A sloping line with both ends fixed can't be made horizontal: nothing moves.
+        let mut q = quad();
+        let before = q.clone();
+        assert!(!solve_constraints(&mut q, true, &[Constraint::Fixed(0), Constraint::Fixed(1), Constraint::Horizontal(0)], &[]));
+        assert_eq!(q, before);
+    }
+
+    #[test]
+    fn small_moves_only() {
+        // Making line 0 horizontal shouldn't drag far-away points along.
+        let mut p = quad();
+        solve_constraints(&mut p, true, &[Constraint::Horizontal(0)], &[]);
+        assert_eq!(p[2], quad()[2]);
+        assert!((p[0].y - 0.5).abs() < 1e-3 && (p[1].y - 0.5).abs() < 1e-3, "{p:?}");
+    }
+
+    #[test]
+    fn infers_the_nearly_true_constraint() {
+        let p = quad();
+        assert_eq!(infer_constraint(&p, &[0]), Some(Constraint::Horizontal(0)));
+        assert_eq!(infer_constraint(&p, &[1]), Some(Constraint::Vertical(1)));
+        assert_eq!(infer_constraint(&p, &[0, 2]), Some(Constraint::Parallel(0, 2)));
+        assert_eq!(infer_constraint(&p, &[0, 1]), Some(Constraint::Perpendicular(0, 1)));
+    }
+
+    #[test]
+    fn indices_follow_inserts_and_removals() {
+        assert_eq!(Constraint::Horizontal(2).after_insert(1), Some(Constraint::Horizontal(3)));
+        assert_eq!(Constraint::Horizontal(0).after_insert(1), None); // that line was split
+        assert_eq!(Constraint::Fixed(3).after_remove(1, 5, true), Some(Constraint::Fixed(2)));
+        assert_eq!(Constraint::Vertical(0).after_remove(1, 5, true), None); // merged away
+        assert_eq!(Constraint::Vertical(3).after_remove(1, 5, true), Some(Constraint::Vertical(2)));
+    }
+}

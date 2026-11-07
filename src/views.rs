@@ -346,11 +346,14 @@ impl App {
                         continue;
                     }
                     let len = (pts[(k + 1) % n] - pts[k]).length();
-                    let off = (b - a).normalized().rot90() * 12.0;
                     let text = format!("{len:.1} mm");
-                    // Skip a label that would sit on top of one already drawn.
-                    let at = a + (b - a) * 0.5 - off;
                     let size = painter.layout_no_wrap(text.clone(), FontId::proportional(11.0), Color32::WHITE).size() + vec2(8.0, 4.0);
+                    // Sit beside the line, far enough out that the whole label clears it
+                    // (and the constraint badges on the other side).
+                    let nrm = (b - a).normalized().rot90();
+                    let clear = 6.0 + nrm.x.abs() * size.x * 0.5 + nrm.y.abs() * size.y * 0.5;
+                    let at = a + (b - a) * 0.5 - nrm * clear;
+                    // Skip a label that would sit on top of one already drawn.
                     if placed.iter().any(|r| r.expand(2.0).intersects(Rect::from_center_size(at, size))) {
                         continue;
                     }
@@ -359,6 +362,55 @@ impl App {
                     self.node_len_tags.push((r, id, k));
                 }
                 let amber = Color32::from_rgb(214, 140, 30);
+                let green = Color32::from_rgb(52, 199, 120);
+                let cons = self.shape_constraints(id);
+                let angle_lock = |i: usize| cons.iter().find_map(|c| if let geom::Constraint::Angle(j, d) = c { (*j == i).then_some(*d) } else { None });
+                let is_fixed = |i: usize| cons.contains(&geom::Constraint::Fixed(i));
+                let lines: Vec<usize> = self.seg_sel.iter().filter(|(sid, k)| *sid == id && *k < segs).map(|(_, k)| *k).collect();
+                // Picked lines glow.
+                for k in &lines {
+                    let (a, b) = (to_s(pts[*k]), to_s(pts[(*k + 1) % n]));
+                    painter.line_segment([a, b], Stroke::new(5.0_f32, Color32::from_rgb(255, 184, 77).gamma_multiply(0.8)));
+                }
+                // Constraint glyphs on the far side of each line from its length label.
+                let glyph = |at: Pos2, kind: u8| {
+                    let r = Rect::from_center_size(at, vec2(16.0, 16.0));
+                    painter.rect_filled(r, CornerRadius::same(4), green.gamma_multiply(0.92));
+                    let (c, w) = (r.center(), Stroke::new(1.6_f32, Color32::WHITE));
+                    match kind {
+                        b'h' => {
+                            painter.line_segment([c + vec2(-5.0, 0.0), c + vec2(5.0, 0.0)], w);
+                        }
+                        b'v' => {
+                            painter.line_segment([c + vec2(0.0, -5.0), c + vec2(0.0, 5.0)], w);
+                        }
+                        b'p' => {
+                            painter.line_segment([c + vec2(-4.5, 4.5), c + vec2(-1.0, -4.5)], w);
+                            painter.line_segment([c + vec2(1.0, 4.5), c + vec2(4.5, -4.5)], w);
+                        }
+                        _ => {
+                            painter.line_segment([c + vec2(0.0, -5.0), c + vec2(0.0, 4.0)], w);
+                            painter.line_segment([c + vec2(-5.0, 4.0), c + vec2(5.0, 4.0)], w);
+                        }
+                    }
+                };
+                let mut per_line = vec![0usize; segs.max(1)];
+                for c in &cons {
+                    let kind = match c {
+                        geom::Constraint::Horizontal(_) => b'h',
+                        geom::Constraint::Vertical(_) => b'v',
+                        geom::Constraint::Parallel(..) => b'p',
+                        geom::Constraint::Perpendicular(..) => b't',
+                        _ => continue,
+                    };
+                    for k in c.segments().into_iter().filter(|k| *k < segs) {
+                        let (a, b) = (to_s(pts[k]), to_s(pts[(k + 1) % n]));
+                        let dir = (b - a).normalized();
+                        let slot = per_line[k] as f32;
+                        per_line[k] += 1;
+                        glyph(a + (b - a) * 0.5 + dir.rot90() * 14.0 + dir * slot * 19.0, kind);
+                    }
+                }
                 // The picked point's corner angle, drawn as an arc with its value.
                 if let Some(i) = picked.filter(|_| self.show_dims) {
                     let (pv, nx) = Self::neighbours(n, closed, i);
@@ -376,8 +428,7 @@ impl App {
                         painter.add(Shape::line(arc, Stroke::new(1.2_f32, Color32::from_rgb(255, 184, 77))));
                         let bis = ((a - v).normalized() + (b - v).normalized()).normalized();
                         let bis = if bis.x.is_nan() { vec2(0.0, -1.0) } else { bis };
-                        let locked = self.node_locks.contains(&(id, i));
-                        tag(v + bis * 36.0, format!("{}{deg:.1}°", if locked { "🔒 " } else { "" }), amber);
+                        tag(v + bis * 36.0, format!("{}{deg:.1}°", if angle_lock(i).is_some() { "🔒 " } else { "" }), amber);
                     }
                 }
                 self.node_probe = pts.iter().map(|p| to_s(*p)).collect();
@@ -392,58 +443,158 @@ impl App {
                         painter.rect_filled(r, CornerRadius::ZERO, if active == Some(i) { ACCENT } else { pal.sheet });
                         painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.2_f32, ACCENT), egui::StrokeKind::Middle);
                     }
-                    if self.node_locks.contains(&(id, i)) {
-                        painter.circle_filled(s + vec2(8.0, -8.0), 4.0, amber);
+                    if is_fixed(i) {
+                        // A fixed point: a green square with a pin through it.
+                        let r = Rect::from_center_size(s + vec2(9.0, -9.0), vec2(10.0, 10.0));
+                        painter.rect_filled(r, CornerRadius::same(2), green);
+                        painter.circle_filled(r.center(), 2.0, Color32::WHITE);
+                    }
+                    if angle_lock(i).is_some() {
+                        painter.circle_filled(s + vec2(-9.0, -9.0), 4.0, amber);
                     }
                 }
-                // A small editor beside the picked point: position, corner angle and lock.
-                if let Some(i) = picked {
-                    // Pinned to the corner of the drawing area so it never covers the labels.
+                // The editor for what's picked: a point (position, angle, fixed) or one/two lines
+                // (horizontal, vertical, parallel, perpendicular), pinned to the drawing area's corner.
+                if picked.is_some() || !lines.is_empty() {
+                    enum Act {
+                        Add(geom::Constraint),
+                        Remove(geom::Constraint),
+                        Move(Pos2),
+                        Turn(f32),
+                    }
+                    let mut acts: Vec<Act> = Vec::new();
                     let at = rect.left_bottom() + vec2(14.0, -14.0);
-                    let angle = self.node_angle(i);
-                    let mut p = pts[i];
-                    let mut deg = angle.unwrap_or(0.0);
-                    let mut locked = self.node_locks.contains(&(id, i));
-                    let (mut moved, mut turned, mut lock_changed) = (false, false, false);
                     egui::Area::new(egui::Id::new("node_editor")).fixed_pos(at).pivot(Align2::LEFT_BOTTOM).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.label(RichText::new(format!("Point {}", i + 1)).strong());
-                            egui::Grid::new("node_grid").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
-                                ui.label("X");
-                                moved |= ui.add(egui::DragValue::new(&mut p.x).speed(0.1).max_decimals(2).suffix(" mm")).changed();
-                                ui.end_row();
-                                ui.label("Y");
-                                moved |= ui.add(egui::DragValue::new(&mut p.y).speed(0.1).max_decimals(2).suffix(" mm")).changed();
-                                ui.end_row();
-                                if angle.is_some() {
-                                    ui.label("Angle");
-                                    turned |= ui.add_enabled(!locked, egui::DragValue::new(&mut deg).range(1.0..=179.0).speed(0.2).max_decimals(1).suffix("°")).changed();
+                            ui.set_max_width(250.0);
+                            if let Some(i) = picked {
+                                let mut p = pts[i];
+                                let angle = self.node_angle(i);
+                                let lock = angle_lock(i);
+                                ui.label(RichText::new(format!("Point {}", i + 1)).strong());
+                                egui::Grid::new("node_grid").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+                                    ui.label("X");
+                                    let mx = ui.add_enabled(!is_fixed(i), egui::DragValue::new(&mut p.x).speed(0.1).max_decimals(2).suffix(" mm")).changed();
                                     ui.end_row();
+                                    ui.label("Y");
+                                    let my = ui.add_enabled(!is_fixed(i), egui::DragValue::new(&mut p.y).speed(0.1).max_decimals(2).suffix(" mm")).changed();
+                                    ui.end_row();
+                                    if mx || my {
+                                        acts.push(Act::Move(p));
+                                    }
+                                    if let Some(a) = angle {
+                                        let mut deg = lock.unwrap_or(a);
+                                        ui.label("Angle");
+                                        if ui.add(egui::DragValue::new(&mut deg).range(1.0..=179.0).speed(0.2).max_decimals(1).suffix("°")).changed() {
+                                            acts.push(Act::Turn(deg));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if let Some(a) = angle {
+                                        let mut locked = lock.is_some();
+                                        if ui.checkbox(&mut locked, "Lock angle").on_hover_text("Keep this corner's angle while you edit").changed() {
+                                            acts.push(if locked { Act::Add(geom::Constraint::Angle(i, a)) } else { Act::Remove(geom::Constraint::Angle(i, lock.unwrap_or(a))) });
+                                        }
+                                    }
+                                    let mut fixed = is_fixed(i);
+                                    if ui.checkbox(&mut fixed, "Fixed").on_hover_text("This point never moves").changed() {
+                                        acts.push(if fixed { Act::Add(geom::Constraint::Fixed(i)) } else { Act::Remove(geom::Constraint::Fixed(i)) });
+                                    }
+                                });
+                            } else {
+                                let len = |k: usize| (pts[(k + 1) % n] - pts[k]).length();
+                                match lines.as_slice() {
+                                    [k] => {
+                                        ui.label(RichText::new(format!("Line {} · {:.1} mm", k + 1, len(*k))).strong());
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Horizontal").clicked() {
+                                                acts.push(Act::Add(geom::Constraint::Horizontal(*k)));
+                                            }
+                                            if ui.button("Vertical").clicked() {
+                                                acts.push(Act::Add(geom::Constraint::Vertical(*k)));
+                                            }
+                                        });
+                                    }
+                                    [a, b] => {
+                                        ui.label(RichText::new(format!("Lines {} and {}", a + 1, b + 1)).strong());
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Parallel").clicked() {
+                                                acts.push(Act::Add(geom::Constraint::Parallel(*a, *b)));
+                                            }
+                                            if ui.button("Perpendicular").clicked() {
+                                                acts.push(Act::Add(geom::Constraint::Perpendicular(*a, *b)));
+                                            }
+                                        });
+                                    }
+                                    _ => {}
                                 }
-                            });
-                            if angle.is_some() {
-                                lock_changed = ui.checkbox(&mut locked, "Lock angle").on_hover_text("Moving the next or previous point keeps this corner's angle").changed();
+                                if let Some(c) = geom::infer_constraint(&pts, &lines) {
+                                    if ui.button("Auto").on_hover_text(format!("Apply what it nearly is: {}", c.label())).clicked() {
+                                        acts.push(Act::Add(c));
+                                    }
+                                }
+                                if lines.len() == 1 {
+                                    ui.label(RichText::new("Shift+click a second line for parallel / perpendicular").small().color(pal.weak));
+                                }
                             }
-                            ui.label(RichText::new("Double-click a length to type it").small().color(pal.weak));
+                            if !cons.is_empty() {
+                                ui.separator();
+                                ui.label(RichText::new("Constraints on this shape").small().color(pal.weak));
+                                for c in cons.iter().take(10) {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("×").on_hover_text("Remove").clicked() {
+                                            acts.push(Act::Remove(*c));
+                                        }
+                                        ui.label(RichText::new(c.label()).small());
+                                    });
+                                }
+                                if cons.len() > 10 {
+                                    ui.label(RichText::new(format!("…and {} more", cons.len() - 10)).small().color(pal.weak));
+                                }
+                            }
+                            ui.label(RichText::new("Click a point or a line · double-click a length to type it").small().color(pal.weak));
                         });
                     });
-                    if moved || turned {
-                        if !self.editing {
-                            self.push_undo();
-                            self.editing = true;
-                        }
-                        if moved {
-                            self.edit_nodes(id, |pts, _| pts[i] = p);
-                        }
-                        if turned {
-                            self.set_node_angle(id, i, deg);
-                        }
-                    }
-                    if lock_changed {
-                        if locked {
-                            self.node_locks.push((id, i));
-                        } else {
-                            self.node_locks.retain(|l| *l != (id, i));
+                    for act in acts {
+                        match act {
+                            Act::Add(c) => self.add_constraint(id, c),
+                            Act::Remove(c) => self.remove_constraint(id, c),
+                            Act::Move(p) => {
+                                let Some(i) = picked else { continue };
+                                if !self.editing {
+                                    self.push_undo();
+                                    self.editing = true;
+                                }
+                                let was = pts[i];
+                                self.edit_nodes(id, |q, _| q[i] = p);
+                                if !self.solve_shape(id, &[i]) {
+                                    self.edit_nodes(id, |q, _| q[i] = was);
+                                    self.toast("That position breaks a constraint");
+                                }
+                            }
+                            Act::Turn(deg) => {
+                                let Some(i) = picked else { continue };
+                                if !self.editing {
+                                    self.push_undo();
+                                    self.editing = true;
+                                }
+                                if angle_lock(i).is_some() {
+                                    // A locked corner: change the constraint's value and re-solve.
+                                    for s in self.doc.constraints.iter_mut().filter(|s| s.shape == id) {
+                                        if let geom::Constraint::Angle(j, d) = &mut s.c {
+                                            if *j == i {
+                                                *d = deg;
+                                            }
+                                        }
+                                    }
+                                    self.solve_shape(id, &[i]);
+                                } else {
+                                    self.set_node_angle(id, i, deg);
+                                    self.solve_shape(id, &[i]);
+                                }
+                            }
                         }
                     }
                 }
@@ -1067,6 +1218,61 @@ impl App {
         }
     }
 
+    /// The sketch constraints on shape `id`.
+    pub fn shape_constraints(&self, id: u64) -> Vec<geom::Constraint> {
+        self.doc.constraints.iter().filter(|c| c.shape == id).map(|c| c.c).collect()
+    }
+
+    /// Re-solve shape `id`'s constraints, keeping `pinned` points where they are.
+    pub fn solve_shape(&mut self, id: u64, pinned: &[usize]) -> bool {
+        let cons = self.shape_constraints(id);
+        if cons.is_empty() {
+            return true;
+        }
+        let mut ok = true;
+        self.edit_nodes(id, |pts, closed| ok = geom::solve_constraints(pts, closed, &cons, pinned));
+        ok
+    }
+
+    /// Add a constraint (replacing one it contradicts outright) and solve. When it can't hold
+    /// with the others, everything goes back as it was.
+    pub fn add_constraint(&mut self, id: u64, c: geom::Constraint) {
+        use geom::Constraint::*;
+        self.push_undo();
+        let same_line = |a: &geom::Constraint| match (a, &c) {
+            (Horizontal(k) | Vertical(k), Horizontal(j) | Vertical(j)) => k == j,
+            (Parallel(a1, b1) | Perpendicular(a1, b1), Parallel(a2, b2) | Perpendicular(a2, b2)) => (a1, b1) == (a2, b2) || (a1, b1) == (b2, a2),
+            (Angle(i, _), Angle(j, _)) | (Fixed(i), Fixed(j)) => i == j,
+            _ => false,
+        };
+        self.doc.constraints.retain(|s| !(s.shape == id && same_line(&s.c)));
+        self.doc.constraints.push(geom::ShapeConstraint { shape: id, c });
+        if self.solve_shape(id, &[]) {
+            self.toast(format!("{} added", c.label()));
+        } else if let Some(prev) = self.undo.pop() {
+            self.doc = prev;
+            self.toast(format!("Can't add {}: it conflicts with the other constraints", c.label()));
+        }
+    }
+
+    pub fn remove_constraint(&mut self, id: u64, c: geom::Constraint) {
+        self.push_undo();
+        self.doc.constraints.retain(|s| !(s.shape == id && s.c == c));
+        self.toast(format!("{} removed", c.label()));
+    }
+
+    /// Keep constraints attached to the right points after points are added or removed.
+    fn remap_constraints(&mut self, id: u64, f: impl Fn(&geom::Constraint) -> Option<geom::Constraint>) {
+        let before = self.doc.constraints.len();
+        self.doc.constraints = std::mem::take(&mut self.doc.constraints)
+            .into_iter()
+            .filter_map(|s| if s.shape == id { f(&s.c).map(|c| geom::ShapeConstraint { shape: id, c }) } else { Some(s) })
+            .collect();
+        if self.doc.constraints.len() < before {
+            self.toast("Constraints on the changed lines were removed");
+        }
+    }
+
     /// Neighbouring node indices of `i` (wrapping round on closed shapes).
     fn neighbours(n: usize, closed: bool, i: usize) -> (Option<usize>, Option<usize>) {
         let prev = if i > 0 { Some(i - 1) } else if closed && n > 2 { Some(n - 1) } else { None };
@@ -1118,15 +1324,18 @@ impl App {
             }
             let Some(p) = pos else { return };
             if let Some((id, i)) = near_node(self, p) {
+                let (n, closed) = self.node_points().map(|(_, pts, c)| (pts.len(), c)).unwrap_or((0, false));
+                if n <= if closed { 3 } else { 2 } {
+                    return;
+                }
                 self.push_undo();
-                self.edit_nodes(id, |pts, closed| {
-                    if pts.len() > if closed { 3 } else { 2 } {
-                        pts.remove(i);
-                    }
+                self.edit_nodes(id, |pts, _| {
+                    pts.remove(i);
                 });
-                // Node numbers shift, so picks and locks on this shape no longer apply.
-                self.node_locks.retain(|(lid, _)| *lid != id);
+                // Point numbers shift: constraints follow, the ones on the merged lines go.
+                self.remap_constraints(id, |c| c.after_remove(i, n, closed));
                 self.node_sel = None;
+                self.seg_sel.clear();
             } else if let Some((id, pts, closed)) = self.node_points() {
                 let poly = geom::Poly { pts, closed };
                 if geom::dist_to_polys(p, std::slice::from_ref(&poly)) <= tol {
@@ -1135,8 +1344,9 @@ impl App {
                     if let Some(k) = seg {
                         self.push_undo();
                         self.edit_nodes(id, |pts, _| pts.insert(k + 1, q));
-                        self.node_locks.retain(|(lid, _)| *lid != id);
+                        self.remap_constraints(id, |c| c.after_insert(k + 1));
                         self.node_sel = Some((id, k + 1));
+                        self.seg_sel.clear();
                     }
                 }
             }
@@ -1145,17 +1355,15 @@ impl App {
         if resp.drag_started_by(PointerButton::Primary) {
             if let Some(p) = press {
                 if let Some((id, idx)) = near_node(self, p) {
-                    self.push_undo();
-                    self.edit_nodes(id, |_, _| {});
                     self.node_sel = Some((id, idx));
-                    // If a neighbouring corner is locked, this node may only slide along its
-                    // segment, so that corner's angle stays the same.
-                    let ray = self.node_points().and_then(|(_, pts, closed)| {
-                        let n = pts.len();
-                        let (prev, next) = Self::neighbours(n, closed, idx);
-                        [prev, next].into_iter().flatten().find(|j| self.node_locks.contains(&(id, *j))).map(|j| (pts[j], (pts[idx] - pts[j]).normalized()))
-                    });
-                    self.drag = Drag::Node { id, idx, ray };
+                    self.seg_sel.clear();
+                    if self.shape_constraints(id).contains(&geom::Constraint::Fixed(idx)) {
+                        self.toast("This point is fixed – remove its Fixed constraint to move it");
+                    } else {
+                        self.push_undo();
+                        self.edit_nodes(id, |_, _| {});
+                        self.drag = Drag::Node { id, idx, ray: None };
+                    }
                 }
             }
         }
@@ -1166,11 +1374,17 @@ impl App {
                 if let Some((o, d)) = ray {
                     p = o + d * (p - o).dot(d).max(0.0);
                 }
+                let mut was = p;
                 self.edit_nodes(id, |pts, _| {
                     if let Some(q) = pts.get_mut(idx) {
+                        was = *q;
                         *q = p;
                     }
                 });
+                if !self.solve_shape(id, &[idx]) {
+                    // No way to keep every constraint with the point there: it stays put.
+                    self.edit_nodes(id, |pts, _| pts[idx] = was);
+                }
             }
         }
         if resp.drag_stopped_by(PointerButton::Primary) {
@@ -1179,11 +1393,42 @@ impl App {
         let on_label = resp.interact_pointer_pos().is_some_and(|sp| self.node_len_tags.iter().any(|(r, _, _)| r.expand(3.0).contains(sp)));
         if resp.clicked() && !on_label {
             if let Some(p) = pos {
-                match near_node(self, p) {
-                    Some(hit) => self.node_sel = Some(hit),
-                    None => {
+                let shift = resp.ctx.input(|i| i.modifiers.shift);
+                let line = self.node_points().and_then(|(id, pts, closed)| {
+                    let poly = geom::Poly { pts, closed };
+                    geom::segments(&poly)
+                        .enumerate()
+                        .map(|(k, (a, b))| (geom::seg_dist(p, a, b), k))
+                        .filter(|(d, _)| *d <= tol)
+                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, k)| (id, k))
+                });
+                match (near_node(self, p), line) {
+                    (Some(hit), _) => {
+                        self.node_sel = Some(hit);
+                        self.seg_sel.clear();
+                    }
+                    (None, Some(hit)) => {
+                        self.node_sel = None;
+                        if shift {
+                            // Shift-click picks a second line (for parallel / perpendicular).
+                            if let Some(k) = self.seg_sel.iter().position(|s| *s == hit) {
+                                self.seg_sel.remove(k);
+                            } else {
+                                self.seg_sel.retain(|s| s.0 == hit.0);
+                                self.seg_sel.push(hit);
+                                if self.seg_sel.len() > 2 {
+                                    self.seg_sel.remove(0);
+                                }
+                            }
+                        } else {
+                            self.seg_sel = vec![hit];
+                        }
+                    }
+                    (None, None) => {
                         self.sel = self.hit_vector(p, tol).into_iter().collect();
                         self.node_sel = None;
+                        self.seg_sel.clear();
                     }
                 }
             }
