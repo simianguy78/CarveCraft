@@ -19,6 +19,8 @@ build 3D relief models, create toolpaths and save G-code.
 - **Output** – generic G-code (mm, absolute) with Z zero on the material surface or the machine bed.
 - Dark and light themes. Jobs are saved as `.ccj` files.
 
+See [FEATURES.md](FEATURES.md) for a CAM feature checklist against VCarve Pro and Aspire.
+
 ## Build and run
 
 Needs [Rust](https://rustup.rs) (stable).
