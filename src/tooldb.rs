@@ -256,7 +256,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Feeds and speeds").strong());
-                        if ui.small_button("Feeds & Speeds calculator…").on_hover_text("Recommend settings for this tool, material and machine").clicked() {
+                        if ui.small_button("Feeds & Speeds calculator…").on_hover_text("General recommendations – your tool maker's spec sheet comes first").clicked() {
                             open_calc = Some(self.db_sel);
                         }
                     });
@@ -275,6 +275,7 @@ impl App {
                         ui.label(RichText::new(format!("{chip:.4} mm per tooth")).color(pal.weak));
                         ui.end_row();
                     });
+                    ui.label(RichText::new("Use the feeds and speeds on your tool maker's spec sheet for this exact tool when you have them.").small().color(pal.weak));
                     if serde_json::to_string(t).unwrap_or_default() != before {
                         changed = true;
                     }
@@ -445,11 +446,19 @@ impl App {
                 });
                 let cur_chip = tool.feed / (tool.rpm.max(1.0) * tool.flutes.max(1) as f32);
                 ui.label(RichText::new(format!("Chip load: now {cur_chip:.3} mm per tooth, recommended {:.3}", adv.chip_load)).small().color(pal.weak));
+                let (lo, hi) = adv.published;
+                let where_ = if cur_chip < lo * 0.85 { " – yours is below it" } else if cur_chip > hi * 1.1 { " – yours is above it" } else { "" };
+                ui.label(RichText::new(format!("Typical published range for this size and material: {lo:.3}–{hi:.3} mm ({:.4}–{:.4} in) per tooth{where_}", lo / 25.4, hi / 25.4)).small().color(pal.weak));
             });
             for n in &adv.notes {
                 ui.label(RichText::new(format!("⚠ {n}")).color(Color32::from_rgb(240, 160, 60)));
             }
-            ui.label(RichText::new("Starting values: test on scrap and adjust by sound and chips.").small().color(pal.weak));
+            // Always point people at the tool maker's own numbers.
+            egui::Frame::new().fill(Color32::from_rgb(61, 139, 253).gamma_multiply(0.14)).stroke(egui::Stroke::new(1.0_f32, ACCENT)).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("ℹ Use your tool maker's specifications").strong());
+                ui.label(RichText::new("These are general starting values from typical published charts. Bits differ in carbide grade, coating, flute shape and length, so check the spec sheet for your exact tool and use its feeds and speeds where they differ. Test on scrap, then adjust by sound and chip size.").small());
+            });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let n = calc.apply.iter().filter(|a| **a).count();

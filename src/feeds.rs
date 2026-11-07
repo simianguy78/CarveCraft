@@ -48,16 +48,42 @@ impl Stock {
             Stock::Softwood
         }
     }
-    /// Chip load per tooth (mm) at 1.5, 3, 6 and 12 mm cutting diameter.
-    fn chip_table(self) -> [f32; 4] {
+    /// Published chip-load ranges for 2-flute spiral router bits, in inches per tooth, at
+    /// 1/8", 1/4" and 1/2" cutting diameter. Compiled from the charts router-bit makers
+    /// commonly publish (Onsrud / Amana / Whiteside style tables); a specific tool's own
+    /// spec sheet always takes priority.
+    pub fn published_inches(self) -> [(f32, f32); 3] {
         match self {
-            Stock::Softwood => [0.025, 0.06, 0.17, 0.30],
-            Stock::Hardwood => [0.02, 0.05, 0.14, 0.25],
-            Stock::Mdf => [0.03, 0.08, 0.20, 0.33],
-            Stock::Plywood => [0.025, 0.065, 0.17, 0.30],
-            Stock::Acrylic => [0.025, 0.06, 0.15, 0.25],
-            Stock::Hdpe => [0.03, 0.08, 0.20, 0.35],
-            Stock::Aluminium => [0.008, 0.02, 0.05, 0.10],
+            Stock::Hardwood => [(0.003, 0.005), (0.009, 0.011), (0.019, 0.021)],
+            Stock::Softwood => [(0.004, 0.006), (0.011, 0.013), (0.021, 0.023)],
+            Stock::Mdf => [(0.004, 0.007), (0.013, 0.016), (0.025, 0.027)],
+            Stock::Plywood => [(0.003, 0.006), (0.010, 0.012), (0.020, 0.022)],
+            Stock::Acrylic => [(0.003, 0.005), (0.006, 0.008), (0.010, 0.012)],
+            Stock::Hdpe => [(0.003, 0.006), (0.007, 0.009), (0.012, 0.016)],
+            Stock::Aluminium => [(0.002, 0.003), (0.003, 0.004), (0.008, 0.010)],
+        }
+    }
+
+    /// The published chip-load range (mm per tooth) for a cutting diameter, interpolated
+    /// between the charted sizes (smaller tools scale down, bigger ones grow slowly).
+    pub fn published_range(self, d: f32) -> (f32, f32) {
+        let t = self.published_inches();
+        let xs = [3.175f32, 6.35, 12.7];
+        let at = |i: usize| (t[i].0 * 25.4, t[i].1 * 25.4);
+        if d <= xs[0] {
+            let (a, b) = at(0);
+            let k = d / xs[0];
+            (a * k, b * k)
+        } else if d >= xs[2] {
+            let (a, b) = at(2);
+            let k = (d / xs[2]).sqrt();
+            (a * k, b * k)
+        } else {
+            let i = if d <= xs[1] { 0 } else { 1 };
+            let f = (d - xs[i]) / (xs[i + 1] - xs[i]);
+            let (a0, b0) = at(i);
+            let (a1, b1) = at(i + 1);
+            (a0 + (a1 - a0) * f, b0 + (b1 - b0) * f)
         }
     }
     /// Cutting surface speed (m/min) the material likes.
@@ -106,6 +132,15 @@ impl Rigidity {
             Rigidity::Industrial => 1.25,
         }
     }
+    /// Where in the published chip-load range to aim: a light frame stays below it (to
+    /// avoid chatter), a standard machine near its low end, a heavy one mid-range.
+    fn chip_position(self, (lo, hi): (f32, f32)) -> f32 {
+        match self {
+            Rigidity::Hobby => lo * 0.6,
+            Rigidity::Standard => lo * 0.9,
+            Rigidity::Industrial => (lo + hi) * 0.5,
+        }
+    }
 }
 
 /// The machine's limits, saved with the tool library.
@@ -133,21 +168,9 @@ pub struct Advice {
     pub pass_depth: f32,
     pub stepover: f32,
     pub chip_load: f32,
+    /// Published chip-load range for this tool size and material (mm per tooth).
+    pub published: (f32, f32),
     pub notes: Vec<String>,
-}
-
-fn lerp_table(t: [f32; 4], d: f32) -> f32 {
-    let xs = [1.5f32, 3.0, 6.0, 12.0];
-    if d <= xs[0] {
-        return t[0] * d / xs[0];
-    }
-    for i in 0..3 {
-        if d <= xs[i + 1] {
-            let f = (d - xs[i]) / (xs[i + 1] - xs[i]);
-            return t[i] + (t[i + 1] - t[i]) * f;
-        }
-    }
-    t[3] * (d / 12.0).sqrt()
 }
 
 /// Recommended settings for `tool` cutting `stock` on `machine`.
@@ -160,7 +183,8 @@ pub fn advise(tool: &Tool, stock: Stock, machine: &Machine) -> Advice {
     };
     let flutes = tool.flutes.max(1) as f32;
     let rig = machine.rigidity.factor();
-    let chip = lerp_table(stock.chip_table(), cutting_d) * rig;
+    let published = stock.published_range(cutting_d);
+    let chip = machine.rigidity.chip_position(published);
     let ideal_rpm = stock.surface_speed() * 1000.0 / (std::f32::consts::PI * cutting_d);
     let rpm = ideal_rpm.clamp(machine.min_rpm, machine.max_rpm).round();
     if ideal_rpm > machine.max_rpm * 1.05 {
@@ -188,6 +212,7 @@ pub fn advise(tool: &Tool, stock: Stock, machine: &Machine) -> Advice {
         pass_depth: (pass_depth * 100.0).round() / 100.0,
         stepover: (stepover * 1000.0).round() / 1000.0,
         chip_load: real_chip,
+        published,
         notes,
     }
 }
@@ -218,6 +243,25 @@ mod tests {
         assert!(alu.feed < soft.feed / 2.0 && alu.rpm < soft.rpm);
         let hobby = advise(&end_mill(3.0), Stock::Softwood, &Machine { rigidity: Rigidity::Hobby, ..m.clone() });
         assert!(hobby.feed < soft.feed && hobby.pass_depth < soft.pass_depth);
+    }
+
+    /// Every material and size lands where the published charts say, for each machine type.
+    #[test]
+    fn chip_loads_match_published_ranges() {
+        for stock in Stock::ALL {
+            for d in [3.175f32, 4.0, 6.35, 9.525, 12.7] {
+                let (lo, hi) = stock.published_range(d);
+                let unlimited = |r| Machine { min_rpm: 1000.0, max_rpm: 18000.0, max_feed: 100000.0, rigidity: r };
+                let chip = |r| advise(&end_mill(d), stock, &unlimited(r)).chip_load;
+                let (ind, std, hob) = (chip(Rigidity::Industrial), chip(Rigidity::Standard), chip(Rigidity::Hobby));
+                assert!(ind >= lo - 1e-4 && ind <= hi + 1e-4, "{stock:?} {d} mm industrial {ind} not in {lo}-{hi}");
+                assert!(std >= lo * 0.85 && std <= hi, "{stock:?} {d} mm standard {std} vs {lo}-{hi}");
+                assert!(hob < std && hob >= lo * 0.5, "{stock:?} {d} mm hobby {hob}");
+            }
+        }
+        // spot check against the charts: 1/4" in hardwood is 0.009-0.011" per tooth
+        let (lo, hi) = Stock::Hardwood.published_range(6.35);
+        assert!((lo / 25.4 - 0.009).abs() < 1e-5 && (hi / 25.4 - 0.011).abs() < 1e-5);
     }
 
     #[test]
