@@ -5,10 +5,23 @@ use crate::geom::{self, ShapeKind, Vector};
 use crate::render3d::{self, Projector, Surface};
 use crate::theme::{self, ACCENT};
 use crate::toolpath::ToolKind;
-use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Mesh, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui};
+use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Mesh, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui};
 
 fn shift_only(resp: &egui::Response) -> bool {
     resp.ctx.input(|i| i.modifiers.shift)
+}
+
+/// Turn the segment leaving node `i` so the inside corner there is `deg`, keeping its length
+/// and the side it bends to.
+fn turn_corner(pts: &mut [Pos2], closed: bool, i: usize, deg: f32) {
+    let (Some(p), Some(n)) = App::neighbours(pts.len(), closed, i) else { return };
+    let v = pts[i];
+    let u = (pts[p] - v).normalized();
+    let w = pts[n] - v;
+    let side = if u.x * w.y - u.y * w.x < 0.0 { -1.0 } else { 1.0 };
+    let (s, c) = (side * deg.to_radians()).sin_cos();
+    let dir = vec2(u.x * c - u.y * s, u.x * s + u.y * c);
+    pts[n] = v + dir * w.length();
 }
 
 /// Inside angle at `v` between the segments to `a` and to `b`, in degrees (0–180).
@@ -306,12 +319,160 @@ impl App {
                 painter.circle_filled(to_s(*p), 3.5, ACCENT);
             }
         } else if self.tool == DrawTool::Node {
-            if let Some((_, pts, _)) = self.node_points() {
+            self.node_len_tags.clear();
+            if let Some((id, pts, closed)) = self.node_points() {
+                let n = pts.len();
                 let active = if let Drag::Node { idx, .. } = self.drag { Some(idx) } else { None };
+                let picked = self.node_sel.filter(|(sid, i)| *sid == id && *i < n).map(|(_, i)| i);
+                let tag = |at: Pos2, text: String, col: Color32| {
+                    let g = painter.layout_no_wrap(text, FontId::proportional(11.0), Color32::WHITE);
+                    let r = Rect::from_center_size(at, g.size() + vec2(8.0, 4.0));
+                    painter.rect_filled(r, CornerRadius::same(4), col.gamma_multiply(0.9));
+                    painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
+                    r
+                };
+                // Length of each segment long enough on screen to label (double-click to type).
+                let segs = if closed { n } else { n.saturating_sub(1) };
+                for k in 0..segs {
+                    let (a, b) = (to_s(pts[k]), to_s(pts[(k + 1) % n]));
+                    if (b - a).length() < 48.0 {
+                        continue;
+                    }
+                    if self.len_edit.as_ref().is_some_and(|(eid, ek, _)| *eid == id && *ek == k) {
+                        continue;
+                    }
+                    let len = (pts[(k + 1) % n] - pts[k]).length();
+                    let off = (b - a).normalized().rot90() * 12.0;
+                    let r = tag(a + (b - a) * 0.5 - off, format!("{len:.1} mm"), ACCENT);
+                    self.node_len_tags.push((r, id, k));
+                }
+                let amber = Color32::from_rgb(214, 140, 30);
+                // The picked point's corner angle, drawn as an arc with its value.
+                if let Some(i) = picked {
+                    let (pv, nx) = Self::neighbours(n, closed, i);
+                    if let (Some(pv), Some(nx), Some(deg)) = (pv, nx, self.node_angle(i)) {
+                        let (a, v, b) = (to_s(pts[pv]), to_s(pts[i]), to_s(pts[nx]));
+                        let a0 = (a - v).angle();
+                        let mut sweep = (b - v).angle() - a0;
+                        while sweep > std::f32::consts::PI {
+                            sweep -= std::f32::consts::TAU;
+                        }
+                        while sweep < -std::f32::consts::PI {
+                            sweep += std::f32::consts::TAU;
+                        }
+                        let arc: Vec<Pos2> = (0..=12).map(|k| v + vec2((a0 + sweep * k as f32 / 12.0).cos(), (a0 + sweep * k as f32 / 12.0).sin()) * 18.0).collect();
+                        painter.add(Shape::line(arc, Stroke::new(1.2_f32, Color32::from_rgb(255, 184, 77))));
+                        let bis = ((a - v).normalized() + (b - v).normalized()).normalized();
+                        let bis = if bis.x.is_nan() { vec2(0.0, -1.0) } else { bis };
+                        let locked = self.node_locks.contains(&(id, i));
+                        tag(v + bis * 36.0, format!("{}{deg:.1}°", if locked { "🔒 " } else { "" }), amber);
+                    }
+                }
+                self.node_probe = pts.iter().map(|p| to_s(*p)).collect();
                 for (i, p) in pts.iter().enumerate() {
-                    let r = Rect::from_center_size(to_s(*p), vec2(7.0, 7.0));
-                    painter.rect_filled(r, CornerRadius::ZERO, if active == Some(i) { ACCENT } else { pal.sheet });
-                    painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.2_f32, ACCENT), egui::StrokeKind::Middle);
+                    let s = to_s(*p);
+                    if picked == Some(i) {
+                        painter.circle_stroke(s, 10.0, Stroke::new(2.0_f32, ACCENT.gamma_multiply(0.6)));
+                        painter.rect_filled(Rect::from_center_size(s, vec2(11.0, 11.0)), CornerRadius::same(2), ACCENT);
+                        painter.rect_stroke(Rect::from_center_size(s, vec2(11.0, 11.0)), CornerRadius::same(2), Stroke::new(1.5_f32, Color32::WHITE), egui::StrokeKind::Middle);
+                    } else {
+                        let r = Rect::from_center_size(s, vec2(7.0, 7.0));
+                        painter.rect_filled(r, CornerRadius::ZERO, if active == Some(i) { ACCENT } else { pal.sheet });
+                        painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.2_f32, ACCENT), egui::StrokeKind::Middle);
+                    }
+                    if self.node_locks.contains(&(id, i)) {
+                        painter.circle_filled(s + vec2(8.0, -8.0), 4.0, amber);
+                    }
+                }
+                // A small editor beside the picked point: position, corner angle and lock.
+                if let Some(i) = picked {
+                    // Pinned to the corner of the drawing area so it never covers the labels.
+                    let at = rect.left_bottom() + vec2(14.0, -14.0);
+                    let angle = self.node_angle(i);
+                    let mut p = pts[i];
+                    let mut deg = angle.unwrap_or(0.0);
+                    let mut locked = self.node_locks.contains(&(id, i));
+                    let (mut moved, mut turned, mut lock_changed) = (false, false, false);
+                    egui::Area::new(egui::Id::new("node_editor")).fixed_pos(at).pivot(Align2::LEFT_BOTTOM).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(RichText::new(format!("Point {}", i + 1)).strong());
+                            egui::Grid::new("node_grid").num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+                                ui.label("X");
+                                moved |= ui.add(egui::DragValue::new(&mut p.x).speed(0.1).max_decimals(2).suffix(" mm")).changed();
+                                ui.end_row();
+                                ui.label("Y");
+                                moved |= ui.add(egui::DragValue::new(&mut p.y).speed(0.1).max_decimals(2).suffix(" mm")).changed();
+                                ui.end_row();
+                                if angle.is_some() {
+                                    ui.label("Angle");
+                                    turned |= ui.add_enabled(!locked, egui::DragValue::new(&mut deg).range(1.0..=179.0).speed(0.2).max_decimals(1).suffix("°")).changed();
+                                    ui.end_row();
+                                }
+                            });
+                            if angle.is_some() {
+                                lock_changed = ui.checkbox(&mut locked, "Lock angle").on_hover_text("Moving the next or previous point keeps this corner's angle").changed();
+                            }
+                            ui.label(RichText::new("Double-click a length to type it").small().color(pal.weak));
+                        });
+                    });
+                    if moved || turned {
+                        if !self.editing {
+                            self.push_undo();
+                            self.editing = true;
+                        }
+                        if moved {
+                            self.edit_nodes(id, |pts, _| pts[i] = p);
+                        }
+                        if turned {
+                            self.set_node_angle(id, i, deg);
+                        }
+                    }
+                    if lock_changed {
+                        if locked {
+                            self.node_locks.push((id, i));
+                        } else {
+                            self.node_locks.retain(|l| *l != (id, i));
+                        }
+                    }
+                }
+                // Typing a new length for a segment after double-clicking its label.
+                if let Some((eid, k, mut text)) = self.len_edit.clone().filter(|(eid, k, _)| *eid == id && *k < segs) {
+                    let (a, b) = (to_s(pts[k]), to_s(pts[(k + 1) % n]));
+                    let at = a + (b - a) * 0.5 - (b - a).normalized().rot90() * 12.0 - vec2(46.0, 12.0);
+                    let mut done: Option<bool> = None;
+                    egui::Area::new(egui::Id::new("len_editor")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let now = (pts[(k + 1) % n] - pts[k]).length();
+                                let r = ui.add(egui::TextEdit::singleline(&mut text).hint_text(format!("{now:.1}")).desired_width(64.0));
+                                r.request_focus();
+                                ui.label("mm");
+                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    // Enter on an empty box just closes it.
+                                    done = Some(!text.trim().is_empty());
+                                } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    done = Some(false);
+                                }
+                            });
+                        });
+                    });
+                    match done {
+                        Some(true) => {
+                            match text.trim().trim_end_matches("mm").trim().parse::<f32>() {
+                                Ok(len) if len > 0.0 => {
+                                    self.push_undo();
+                                    self.set_segment_length(eid, k, len);
+                                    self.toast(format!("Segment set to {len} mm"));
+                                }
+                                _ => self.toast("Type a length in mm, like 25 or 12.5"),
+                            }
+                            self.len_edit = None;
+                        }
+                        Some(false) => self.len_edit = None,
+                        None => self.len_edit = Some((eid, k, text)),
+                    }
+                } else {
+                    self.len_edit = None;
                 }
             }
         } else if !self.poly_pts.is_empty() {
@@ -448,7 +609,7 @@ impl App {
             DrawTool::Freehand => "Drag to sketch · finish near the start to close the shape",
             DrawTool::Text => "Click where the text should go",
             DrawTool::Arc => "Click the start, then the end, then a point the arc passes through",
-            DrawTool::Node => "Drag nodes to reshape · double-click a line to add a node, a node to delete it · click another shape to edit it",
+            DrawTool::Node => "Click a point to pick it (set angle / lock) · drag points · double-click a length to type it · double-click a line to add a point, a point to delete it",
             DrawTool::Trim => "Click the piece of a vector to cut away between the lines that cross it",
             DrawTool::Fillet => "Click a corner to round it · radius is in the Draw card",
             DrawTool::Sculpt => "Paint on the model · brush size and strength are in the Sculpt card",
@@ -870,30 +1031,81 @@ impl App {
         (polys.len() == 1).then(|| (id, polys[0].pts.clone(), polys[0].closed))
     }
 
+    /// Run `f` on the node points of shape `id` in job coordinates (turning it into a free
+    /// curve first), then store them back.
+    pub fn edit_nodes(&mut self, id: u64, f: impl FnOnce(&mut Vec<Pos2>, bool)) {
+        if let Some(v) = self.doc.vectors.iter_mut().find(|v| v.id == id) {
+            if v.to_path() {
+                let c = v.center;
+                if let ShapeKind::Path { pts, closed } = &mut v.kind {
+                    let mut world: Vec<Pos2> = pts.iter().map(|p| pos2(p.x + c.x, p.y + c.y)).collect();
+                    f(&mut world, *closed);
+                    *pts = world.iter().map(|p| pos2(p.x - c.x, p.y - c.y)).collect();
+                }
+            }
+        }
+    }
+
+    /// Neighbouring node indices of `i` (wrapping round on closed shapes).
+    fn neighbours(n: usize, closed: bool, i: usize) -> (Option<usize>, Option<usize>) {
+        let prev = if i > 0 { Some(i - 1) } else if closed && n > 2 { Some(n - 1) } else { None };
+        let next = if i + 1 < n { Some(i + 1) } else if closed && n > 2 { Some(0) } else { None };
+        (prev, next)
+    }
+
+    /// Inside corner angle at node `i`, when it has a node on both sides.
+    pub fn node_angle(&self, i: usize) -> Option<f32> {
+        let (_, pts, closed) = self.node_points()?;
+        let (p, n) = Self::neighbours(pts.len(), closed, i);
+        corner_angle(pts[p?], pts[i], pts[n?])
+    }
+
+    /// Turn the segment leaving node `i` so the corner there becomes `deg`, keeping its length.
+    pub fn set_node_angle(&mut self, id: u64, i: usize, deg: f32) {
+        self.edit_nodes(id, |pts, closed| turn_corner(pts, closed, i, deg));
+    }
+
+    /// Make segment `k` (node k to the next) `len` long. The end away from the picked node moves.
+    pub fn set_segment_length(&mut self, id: u64, k: usize, len: f32) {
+        let picked = self.node_sel.filter(|(sid, _)| *sid == id).map(|(_, i)| i);
+        self.edit_nodes(id, |pts, _| {
+            let n = pts.len();
+            let (a, b) = (k % n, (k + 1) % n);
+            let (fixed, moving) = if picked == Some(b) { (b, a) } else { (a, b) };
+            let d = pts[moving] - pts[fixed];
+            if d.length() > 1e-6 && len > 0.0 {
+                pts[moving] = pts[fixed] + d.normalized() * len;
+            }
+        });
+    }
+
     fn node_input(&mut self, resp: &egui::Response, pos: Option<Pos2>, press: Option<Pos2>, tol: f32) {
         let near_node = |app: &App, p: Pos2| {
             let (id, pts, _) = app.node_points()?;
             pts.iter().enumerate().map(|(i, q)| ((*q - p).length(), i)).filter(|(d, _)| *d <= tol).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, i)| (id, i))
         };
-        let with_path = |app: &mut App, id: u64, f: &mut dyn FnMut(&mut Vec<Pos2>, bool, Pos2)| {
-            if let Some(v) = app.doc.vectors.iter_mut().find(|v| v.id == id) {
-                if v.to_path() {
-                    let c = v.center;
-                    if let ShapeKind::Path { pts, closed } = &mut v.kind {
-                        f(pts, *closed, c);
-                    }
+        if resp.double_clicked() {
+            // Double-clicking a length label opens it for typing a new length.
+            if let Some(sp) = resp.interact_pointer_pos() {
+                if let Some((_, id, k)) = self.node_len_tags.iter().find(|(r, _, _)| r.expand(3.0).contains(sp)) {
+                    let (id, k) = (*id, *k);
+                    let len = self.node_points().map(|(_, pts, _)| (pts[(k + 1) % pts.len()] - pts[k]).length()).unwrap_or(0.0);
+                    let _ = len;
+                    self.len_edit = Some((id, k, String::new()));
+                    return;
                 }
             }
-        };
-        if resp.double_clicked() {
             let Some(p) = pos else { return };
             if let Some((id, i)) = near_node(self, p) {
                 self.push_undo();
-                with_path(self, id, &mut |pts, closed, _| {
+                self.edit_nodes(id, |pts, closed| {
                     if pts.len() > if closed { 3 } else { 2 } {
                         pts.remove(i);
                     }
                 });
+                // Node numbers shift, so picks and locks on this shape no longer apply.
+                self.node_locks.retain(|(lid, _)| *lid != id);
+                self.node_sel = None;
             } else if let Some((id, pts, closed)) = self.node_points() {
                 let poly = geom::Poly { pts, closed };
                 if geom::dist_to_polys(p, std::slice::from_ref(&poly)) <= tol {
@@ -901,7 +1113,9 @@ impl App {
                     let seg = geom::segments(&poly).enumerate().min_by(|a, b| geom::seg_dist(q, a.1 .0, a.1 .1).total_cmp(&geom::seg_dist(q, b.1 .0, b.1 .1))).map(|(k, _)| k);
                     if let Some(k) = seg {
                         self.push_undo();
-                        with_path(self, id, &mut |pts, _, c| pts.insert(k + 1, pos2(q.x - c.x, q.y - c.y)));
+                        self.edit_nodes(id, |pts, _| pts.insert(k + 1, q));
+                        self.node_locks.retain(|(lid, _)| *lid != id);
+                        self.node_sel = Some((id, k + 1));
                     }
                 }
             }
@@ -911,17 +1125,29 @@ impl App {
             if let Some(p) = press {
                 if let Some((id, idx)) = near_node(self, p) {
                     self.push_undo();
-                    with_path(self, id, &mut |_, _, _| {});
-                    self.drag = Drag::Node { id, idx };
+                    self.edit_nodes(id, |_, _| {});
+                    self.node_sel = Some((id, idx));
+                    // If a neighbouring corner is locked, this node may only slide along its
+                    // segment, so that corner's angle stays the same.
+                    let ray = self.node_points().and_then(|(_, pts, closed)| {
+                        let n = pts.len();
+                        let (prev, next) = Self::neighbours(n, closed, idx);
+                        [prev, next].into_iter().flatten().find(|j| self.node_locks.contains(&(id, *j))).map(|j| (pts[j], (pts[idx] - pts[j]).normalized()))
+                    });
+                    self.drag = Drag::Node { id, idx, ray };
                 }
             }
         }
         if resp.dragged_by(PointerButton::Primary) {
-            if let (Drag::Node { id, idx }, Some(p)) = (&self.drag, pos) {
-                let (id, idx, p) = (*id, *idx, self.snap_pt(p));
-                with_path(self, id, &mut |pts, _, c| {
+            if let (Drag::Node { id, idx, ray }, Some(p)) = (&self.drag, pos) {
+                let (id, idx, ray) = (*id, *idx, *ray);
+                let mut p = self.snap_pt(p);
+                if let Some((o, d)) = ray {
+                    p = o + d * (p - o).dot(d).max(0.0);
+                }
+                self.edit_nodes(id, |pts, _| {
                     if let Some(q) = pts.get_mut(idx) {
-                        *q = pos2(p.x - c.x, p.y - c.y);
+                        *q = p;
                     }
                 });
             }
@@ -929,10 +1155,15 @@ impl App {
         if resp.drag_stopped_by(PointerButton::Primary) {
             self.drag = Drag::None;
         }
-        if resp.clicked() {
+        let on_label = resp.interact_pointer_pos().is_some_and(|sp| self.node_len_tags.iter().any(|(r, _, _)| r.expand(3.0).contains(sp)));
+        if resp.clicked() && !on_label {
             if let Some(p) = pos {
-                if near_node(self, p).is_none() {
-                    self.sel = self.hit_vector(p, tol).into_iter().collect();
+                match near_node(self, p) {
+                    Some(hit) => self.node_sel = Some(hit),
+                    None => {
+                        self.sel = self.hit_vector(p, tol).into_iter().collect();
+                        self.node_sel = None;
+                    }
                 }
             }
         }
@@ -1128,5 +1359,16 @@ mod polyline_tests {
         let b = corner_angle(pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(20.0, 0.0)).unwrap();
         assert!((b - 180.0).abs() < 1e-3);
         assert!(corner_angle(pos2(1.0, 1.0), pos2(1.0, 1.0), pos2(2.0, 2.0)).is_none());
+    }
+
+    #[test]
+    fn turning_a_corner_sets_its_angle_and_keeps_length() {
+        let mut pts = vec![pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(14.0, 9.0), pos2(0.0, 10.0)];
+        let len = (pts[2] - pts[1]).length();
+        turn_corner(&mut pts, true, 1, 90.0);
+        let a = corner_angle(pts[0], pts[1], pts[2]).unwrap();
+        assert!((a - 90.0).abs() < 1e-3, "{a}");
+        assert!(((pts[2] - pts[1]).length() - len).abs() < 1e-3);
+        assert!(pts[2].y > 0.0, "keeps bending the same way");
     }
 }

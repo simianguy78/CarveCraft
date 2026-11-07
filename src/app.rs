@@ -5,7 +5,7 @@ use crate::model::{Brush, Combine, Component, Model, Profile, ReliefKind, Source
 use crate::render3d::Camera;
 use crate::theme;
 use crate::toolpath::{self, Material, Op, Sim, Tool, ToolKind, Toolpath};
-use egui::{pos2, vec2, Pos2, Rect, TextureHandle};
+use egui::{pos2, vec2, Pos2, Rect, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -187,7 +187,8 @@ pub enum Drag {
     Create { start: Pos2 },
     Freehand { pts: Vec<Pos2> },
     Sculpt { target: f32 },
-    Node { id: u64, idx: usize },
+    /// Dragging a node; `ray` keeps it on a line when a neighbouring corner's angle is locked.
+    Node { id: u64, idx: usize, ray: Option<(Pos2, Vec2)> },
     /// Dragging a scale handle: `hx`/`hy` say which side (-1 min, 0 middle, 1 max).
     Scale { orig: Vec<Vector>, bounds: Rect, hx: i8, hy: i8 },
     /// Dragging a rotate handle around the selection centre.
@@ -231,6 +232,15 @@ pub struct App {
     pub sim_running: bool,
     pub sim_speed: f32,
     pub show_tool_db: bool,
+    /// Node editing: the picked node (shape id, index), corners with a locked angle,
+    /// the segment length being typed, and where last frame's length labels were drawn.
+    pub node_sel: Option<(u64, usize)>,
+    pub node_locks: Vec<(u64, usize)>,
+    pub len_edit: Option<(u64, usize, String)>,
+    pub node_len_tags: Vec<(Rect, u64, usize)>,
+    /// Screen positions of the nodes being edited (for scripted checks).
+    pub node_probe: Vec<Pos2>,
+    pub script_node: bool,
     /// Screen positions of a rotate handle and the selection centre (for scripted checks).
     pub probe: Option<(Pos2, Pos2)>,
     /// A scripted rotate drag runs during the screenshot (CARVECRAFT_START=rotate).
@@ -291,6 +301,12 @@ impl App {
             sim_running: false,
             sim_speed: 3.2,
             show_tool_db: false,
+            node_sel: None,
+            node_locks: Vec::new(),
+            len_edit: None,
+            node_len_tags: Vec::new(),
+            node_probe: Vec::new(),
+            script_node: false,
             probe: None,
             script_rotate: false,
             script_poly: false,
@@ -325,6 +341,14 @@ impl App {
                 "design" => app.left_tab = LeftTab::Design,
                 "light" => app.dark = false,
                 "rotate" => app.script_rotate = true,
+                "node" => {
+                    // A simple four-sided shape to node-edit.
+                    app.script_node = true;
+                    app.tool = DrawTool::Node;
+                    let pts = vec![pos2(60.0, 150.0), pos2(140.0, 150.0), pos2(150.0, 90.0), pos2(70.0, 70.0)];
+                    let id = app.add_path(pts, true);
+                    app.sel = vec![id];
+                }
                 "poly" => {
                     app.script_poly = true;
                     app.tool = DrawTool::Polyline;
@@ -998,6 +1022,39 @@ impl App {
 }
 
 impl App {
+    /// Pick the second node, then double-click the first length label and type 100.
+    fn scripted_node(&mut self, raw: &mut egui::RawInput) {
+        let f = self.frames;
+        let ev = &mut raw.events;
+        let press = |ev: &mut Vec<egui::Event>, p: Pos2, down| ev.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() });
+        if let Some(n) = self.node_probe.get(1).copied() {
+            match f {
+                30 => ev.push(egui::Event::PointerMoved(n)),
+                31 => press(ev, n, true),
+                32 => press(ev, n, false),
+                _ => {}
+            }
+        }
+        if let Some((r, _, _)) = self.node_len_tags.iter().find(|(_, _, k)| *k == 1).copied() {
+            let c = r.center();
+            match f {
+                60 => ev.push(egui::Event::PointerMoved(c)),
+                61 => {
+                    // both clicks in one frame, so frame timing can't split the double-click
+                    for down in [true, false, true, false] {
+                        press(ev, c, down);
+                    }
+                }
+                _ => {}
+            }
+        }
+        match f {
+            71 => ev.push(egui::Event::Text("100".into())),
+            73 => ev.push(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }),
+            _ => {}
+        }
+    }
+
     /// Click three polyline points, then hover by the start point (it should offer to close).
     fn scripted_polyline(&mut self, raw: &mut egui::RawInput) {
         let f = self.frames;
@@ -1027,6 +1084,9 @@ impl eframe::App for App {
         }
         if self.script_poly {
             self.scripted_polyline(raw);
+        }
+        if self.script_node {
+            self.scripted_node(raw);
         }
     }
 
