@@ -240,6 +240,8 @@ pub struct App {
     pub node_len_tags: Vec<(Rect, u64, usize)>,
     /// Screen positions of the nodes being edited (for scripted checks).
     pub node_probe: Vec<Pos2>,
+    /// Show length and angle labels while drawing and node editing.
+    pub show_dims: bool,
     pub script_node: bool,
     /// Screen positions of a rotate handle and the selection centre (for scripted checks).
     pub probe: Option<(Pos2, Pos2)>,
@@ -306,6 +308,7 @@ impl App {
             len_edit: None,
             node_len_tags: Vec::new(),
             node_probe: Vec::new(),
+            show_dims: true,
             script_node: false,
             probe: None,
             script_rotate: false,
@@ -341,6 +344,11 @@ impl App {
                 "design" => app.left_tab = LeftTab::Design,
                 "light" => app.dark = false,
                 "rotate" => app.script_rotate = true,
+                "dense" => {
+                    // Node-edit the rounded plaque outline: lots of short segments.
+                    app.tool = DrawTool::Node;
+                    app.sel = app.doc.vectors.iter().take(1).map(|v| v.id).collect();
+                }
                 "node" => {
                     // A simple four-sided shape to node-edit.
                     app.script_node = true;

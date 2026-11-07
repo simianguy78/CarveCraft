@@ -277,7 +277,10 @@ impl App {
                 Drag::Rotate { angle, .. } => format!("{angle:.1}°"),
                 _ => format!("{:.1} × {:.1}", b.width(), b.height()),
             };
-            painter.text(sr.center_top() - vec2(0.0, 10.0), Align2::CENTER_BOTTOM, label, FontId::proportional(11.0), ACCENT);
+            // In node edit the segment lengths take over; the box size would only overlap them.
+            if self.tool != DrawTool::Node {
+                painter.text(sr.center_top() - vec2(0.0, 10.0), Align2::CENTER_BOTTOM, label, FontId::proportional(11.0), ACCENT);
+            }
         }
 
         // in-progress previews
@@ -333,7 +336,8 @@ impl App {
                 };
                 // Length of each segment long enough on screen to label (double-click to type).
                 let segs = if closed { n } else { n.saturating_sub(1) };
-                for k in 0..segs {
+                let mut placed: Vec<Rect> = Vec::new();
+                for k in (0..segs).filter(|_| self.show_dims) {
                     let (a, b) = (to_s(pts[k]), to_s(pts[(k + 1) % n]));
                     if (b - a).length() < 48.0 {
                         continue;
@@ -343,12 +347,20 @@ impl App {
                     }
                     let len = (pts[(k + 1) % n] - pts[k]).length();
                     let off = (b - a).normalized().rot90() * 12.0;
-                    let r = tag(a + (b - a) * 0.5 - off, format!("{len:.1} mm"), ACCENT);
+                    let text = format!("{len:.1} mm");
+                    // Skip a label that would sit on top of one already drawn.
+                    let at = a + (b - a) * 0.5 - off;
+                    let size = painter.layout_no_wrap(text.clone(), FontId::proportional(11.0), Color32::WHITE).size() + vec2(8.0, 4.0);
+                    if placed.iter().any(|r| r.expand(2.0).intersects(Rect::from_center_size(at, size))) {
+                        continue;
+                    }
+                    let r = tag(at, text, ACCENT);
+                    placed.push(r);
                     self.node_len_tags.push((r, id, k));
                 }
                 let amber = Color32::from_rgb(214, 140, 30);
                 // The picked point's corner angle, drawn as an arc with its value.
-                if let Some(i) = picked {
+                if let Some(i) = picked.filter(|_| self.show_dims) {
                     let (pv, nx) = Self::neighbours(n, closed, i);
                     if let (Some(pv), Some(nx), Some(deg)) = (pv, nx, self.node_angle(i)) {
                         let (a, v, b) = (to_s(pts[pv]), to_s(pts[i]), to_s(pts[nx]));
@@ -492,18 +504,27 @@ impl App {
                 painter.rect_filled(r, CornerRadius::same(4), col.gamma_multiply(0.9));
                 painter.galley(r.min + vec2(4.0, 2.0), g, Color32::WHITE);
             };
-            // Length of every segment, the live one included, on a small pill at its middle.
-            for w in job.windows(2) {
+            // Length of every segment, the live one included, on a small pill at its middle
+            // (newest first, so the live one wins when labels would overlap).
+            let mut placed: Vec<Rect> = Vec::new();
+            for w in job.windows(2).rev().filter(|_| self.show_dims) {
                 let len = (w[1] - w[0]).length();
                 if len < 1e-3 {
                     continue;
                 }
                 let (a, b) = (to_s(w[0]), to_s(w[1]));
                 let n = (b - a).normalized().rot90() * 12.0;
-                tag(a + (b - a) * 0.5 - n, format!("{len:.1} mm"), ACCENT);
+                let at = a + (b - a) * 0.5 - n;
+                let text = format!("{len:.1} mm");
+                let size = painter.layout_no_wrap(text.clone(), FontId::proportional(11.0), Color32::WHITE).size() + vec2(8.0, 4.0);
+                if placed.iter().any(|r| r.expand(2.0).intersects(Rect::from_center_size(at, size))) {
+                    continue;
+                }
+                placed.push(Rect::from_center_size(at, size));
+                tag(at, text, ACCENT);
             }
             // Corner angle at each clicked point that has segments on both sides.
-            for i in 1..job.len().saturating_sub(1) {
+            for i in (1..job.len().saturating_sub(1)).filter(|_| self.show_dims) {
                 if let Some(deg) = corner_angle(job[i - 1], job[i], job[i + 1]) {
                     let (a, v, b) = (to_s(job[i - 1]), to_s(job[i]), to_s(job[i + 1]));
                     // Put the label inside the corner, along the bisector.

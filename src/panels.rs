@@ -365,6 +365,7 @@ impl App {
                         ui.toggle_value(&mut self.snap, "Snap");
                         ui.toggle_value(&mut self.show_model2d, "Model");
                         ui.toggle_value(&mut self.show_paths, "Toolpaths");
+                        ui.toggle_value(&mut self.show_dims, "Dimensions").on_hover_text("Show lengths and angles while drawing and editing points");
                         // Active layer picker, like the original's Layer drop-down.
                         ui.add_space(8.0);
                         ui.label(RichText::new("Layer").color(pal.weak));
