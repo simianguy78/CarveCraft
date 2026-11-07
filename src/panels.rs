@@ -258,8 +258,8 @@ impl App {
         });
         ui.menu_button("Toolpaths", |ui| {
             for (label, op, tool) in [
-                ("Profile", crate::toolpath::Op::Profile { depth: 6.0, side: crate::toolpath::Side::Outside }, 0usize),
-                ("Pocket", crate::toolpath::Op::Pocket { depth: 3.0, raster: true }, 0),
+                ("Profile", crate::toolpath::Op::profile(6.0, crate::toolpath::Side::Outside), 0usize),
+                ("Pocket", crate::toolpath::Op::pocket(3.0, true), 0),
                 ("Drilling", crate::toolpath::Op::Drill { depth: 8.0 }, 0),
                 ("V-Carve", crate::toolpath::Op::VCarve { flat_depth: 0.0 }, 4),
                 ("Quick engrave", crate::toolpath::Op::Engrave { depth: 1.0 }, 6),

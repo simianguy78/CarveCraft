@@ -1,5 +1,6 @@
 //! Tools, toolpath generation, cutting simulation and G-code output.
 
+use crate::cam::{self, Post};
 use crate::geom::{self, Field, Poly};
 use crate::model::{self, Model};
 use eframe::egui::{pos2, Pos2, Rect};
@@ -22,11 +23,14 @@ pub struct Material {
     /// Z zero on the machine bed instead of the material surface.
     #[serde(default)]
     pub z_bed: bool,
+    /// Which machine controller the G-code is written for.
+    #[serde(default)]
+    pub post: Post,
 }
 
 impl Default for Material {
     fn default() -> Self {
-        Self { w: 300.0, h: 200.0, thickness: 20.0, origin: Origin::BottomLeft, safe_z: 5.0, z_bed: false }
+        Self { w: 300.0, h: 200.0, thickness: 20.0, origin: Origin::BottomLeft, safe_z: 5.0, z_bed: false, post: Post::default() }
     }
 }
 
@@ -108,8 +112,34 @@ pub enum Side {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Op {
-    Profile { depth: f32, side: Side },
-    Pocket { depth: f32, raster: bool },
+    Profile {
+        depth: f32,
+        side: Side,
+        /// Depth the first pass starts from (0 = the material top).
+        #[serde(default)]
+        start: f32,
+        /// Extra material left on the wall (negative cuts further).
+        #[serde(default)]
+        allowance: f32,
+        /// Climb milling (else conventional).
+        #[serde(default = "yes")]
+        climb: bool,
+        #[serde(default)]
+        tabs: cam::Tabs,
+        /// Ramp each pass in over this distance (0 = plunge straight down).
+        #[serde(default)]
+        ramp: f32,
+    },
+    Pocket {
+        depth: f32,
+        raster: bool,
+        #[serde(default)]
+        start: f32,
+        #[serde(default)]
+        allowance: f32,
+        #[serde(default = "yes")]
+        climb: bool,
+    },
     Drill { depth: f32 },
     VCarve { flat_depth: f32 },
     Engrave { depth: f32 },
@@ -119,7 +149,17 @@ pub enum Op {
     Texture { depth: f32, length: f32 },
 }
 
+fn yes() -> bool {
+    true
+}
+
 impl Op {
+    pub fn profile(depth: f32, side: Side) -> Op {
+        Op::Profile { depth, side, start: 0.0, allowance: 0.0, climb: true, tabs: cam::Tabs::default(), ramp: 0.0 }
+    }
+    pub fn pocket(depth: f32, raster: bool) -> Op {
+        Op::Pocket { depth, raster, start: 0.0, allowance: 0.0, climb: true }
+    }
     pub fn label(&self) -> &'static str {
         match self {
             Op::Profile { .. } => "Profile",
@@ -176,6 +216,13 @@ impl Toolpath {
     }
 }
 
+/// Pass depths from `start` down to `depth`, each at most `pass` deep.
+fn pass_levels_from(start: f32, depth: f32, pass: f32) -> Vec<f32> {
+    let span = (depth - start).max(0.01);
+    let n = (span / pass.max(0.05)).ceil().max(1.0) as usize;
+    (1..=n).map(|k| -(start + span * k as f32 / n as f32)).collect()
+}
+
 fn pass_levels(depth: f32, pass: f32) -> Vec<f32> {
     let depth = depth.max(0.01);
     let n = (depth / pass.max(0.05)).ceil().max(1.0) as usize;
@@ -203,84 +250,81 @@ pub fn generate(op: &Op, tool: &Tool, polys: &[Poly], model: &Model, mat: &Mater
     let r = tool.radius();
     let mut out: Chains = Vec::new();
     match op {
-        Op::Profile { depth, side } => {
-            let loops: Vec<Poly> = match side {
-                Side::On => polys.to_vec(),
-                Side::Outside => geom::offset_polys(&closed_only(polys), r),
-                Side::Inside => geom::offset_polys(&closed_only(polys), -r),
+        Op::Profile { depth, side, start, allowance, climb, tabs, ramp } => {
+            // Tool-centre loops from exact offsets (Clipper2), allowance leaving extra material.
+            let off = r + allowance;
+            let (mut closed_loops, open): (Vec<Poly>, Vec<Poly>) = match side {
+                Side::On => polys.iter().cloned().partition(|p| p.closed),
+                Side::Outside => (geom::offset_polys(&closed_only(polys), off), Vec::new()),
+                Side::Inside => (geom::offset_polys(&closed_only(polys), -off), Vec::new()),
             };
-            for z in pass_levels(*depth, tool.pass_depth) {
-                for l in &loops {
-                    let pts = if l.closed { close(&l.pts) } else { l.pts.clone() };
-                    out.push(chain_at(&pts, z));
+            // Outside (and on-line) cuts have the part on the loop's inside; inside cuts on its outside.
+            cam::orient_loops(&mut closed_loops, !matches!(side, Side::Inside), *climb);
+            let tab_top = -depth + tabs.thickness;
+            let mut z_prev = -start;
+            for z in pass_levels_from(*start, *depth, tool.pass_depth) {
+                for l in &closed_loops {
+                    let perimeter = geom::poly_length(&close(&l.pts));
+                    let ch = cam::ramped_loop(&l.pts, z_prev, z, *ramp);
+                    out.push(if tabs.on && z < tab_top { cam::apply_tabs(&ch, tabs, tab_top, perimeter) } else { ch });
                 }
+                for l in &open {
+                    out.push(chain_at(&l.pts, z));
+                }
+                z_prev = z;
             }
         }
-        Op::Pocket { depth, raster } => {
+        Op::Pocket { depth, raster, start, allowance, climb } => {
             let closed = closed_only(polys);
-            if closed.is_empty() {
+            // Where the tool's centre may go: the shape shrunk by the tool radius (and allowance).
+            let region = geom::offset_polys(&closed, -(r + allowance));
+            if region.is_empty() {
                 return out;
             }
-            let cell = field_cell(&closed, 600.0, 0.05, 0.5);
-            let f = Field::build(&closed, cell, cell * 3.0);
             let so = tool.stepover.max(0.05);
-            let finish = f.contours(r);
-            for z in pass_levels(*depth, tool.pass_depth) {
+            for z in pass_levels_from(*start, *depth, tool.pass_depth) {
+                let mut level: Vec<cam::Chain> = Vec::new();
+                let mut boundary = region.clone();
+                cam::orient_loops(&mut boundary, false, *climb);
                 if *raster {
-                    let b = geom::bounds_of(&closed);
-                    let mut y = b.min.y + r + so * 0.5;
-                    let mut flip = false;
-                    while y < b.max.y - r {
-                        let mut segs: Vec<Vec<[f32; 3]>> = Vec::new();
-                        let mut cur: Vec<[f32; 3]> = Vec::new();
-                        let mut x = b.min.x;
-                        let step = cell * 0.5;
-                        while x <= b.max.x {
-                            let ins = f.sample(pos2(x, y)) >= r;
-                            if ins {
-                                if cur.is_empty() {
-                                    cur.push([x, y, z]);
-                                }
-                            } else if !cur.is_empty() {
-                                cur.push([x - step, y, z]);
-                                segs.push(std::mem::take(&mut cur));
-                            }
-                            x += step;
-                        }
-                        if !cur.is_empty() {
-                            cur.push([b.max.x, y, z]);
-                            segs.push(cur);
-                        }
-                        if flip {
+                    // Zig-zag lines clipped exactly to the region, then one pass round its edge.
+                    let b = geom::bounds_of(&region);
+                    let rows = ((b.height() / so).ceil() as usize).max(1);
+                    let step = b.height() / rows as f32;
+                    for row in 0..=rows {
+                        let y = (b.min.y + row as f32 * step).clamp(b.min.y + 1e-3, b.max.y - 1e-3);
+                        let mut segs: Vec<cam::Chain> = cam::scanline(&region, y).into_iter().map(|(x0, x1)| vec![[x0, y, z], [x1, y, z]]).collect();
+                        if row % 2 == 1 {
                             segs.reverse();
                             for s in &mut segs {
                                 s.reverse();
                             }
                         }
-                        out.extend(segs.into_iter().filter(|s| s.len() >= 2));
-                        flip = !flip;
-                        y += so;
+                        level.extend(segs);
                     }
                 } else {
-                    let mut level = r + so;
-                    let mut rings = Vec::new();
-                    for _ in 0..400 {
-                        let c = f.contours(level);
-                        if c.is_empty() {
-                            break;
-                        }
-                        rings.push(c);
-                        level += so;
+                    // Offset rings from the centre outwards; the last one is the finishing edge.
+                    let mut rings: Vec<Vec<Poly>> = Vec::new();
+                    let mut cur = geom::offset_polys(&region, -so);
+                    while !cur.is_empty() && rings.len() < 2000 {
+                        let next = geom::offset_polys(&cur, -so);
+                        rings.push(cur);
+                        cur = next;
                     }
-                    for ring in rings.iter().rev() {
+                    for mut ring in rings.into_iter().rev() {
+                        cam::orient_loops(&mut ring, false, *climb);
                         for l in ring {
-                            out.push(chain_at(&close(l), z));
+                            let from = level.last().and_then(|c| c.last()).map(|p| pos2(p[0], p[1])).unwrap_or(l.pts[0]);
+                            level.push(chain_at(&close(&cam::start_nearest(&l.pts, from)), z));
                         }
                     }
                 }
-                for l in &finish {
-                    out.push(chain_at(&close(l), z));
+                for l in &boundary {
+                    let from = level.last().and_then(|c| c.last()).map(|p| pos2(p[0], p[1])).unwrap_or(l.pts[0]);
+                    level.push(chain_at(&close(&cam::start_nearest(&l.pts, from)), z));
                 }
+                // Stay down between passes wherever the link is inside the pocket.
+                out.extend(cam::link_chains(level, &region));
             }
         }
         Op::Drill { depth } => {
@@ -643,46 +687,81 @@ fn stamp(s: &mut Stock, k: &Kernel, p: [f32; 3]) {
 
 // ---------------------------------------------------------------- G-code
 
+/// Write the toolpaths as G-code for the chosen machine (the material's post-processor).
+///
+/// Every chain becomes: retract to safe Z, rapid over its start, feed down at the plunge rate,
+/// then cut at the feed rate. Level runs that follow a circle are written as G2/G3 arcs.
 pub fn gcode(paths: &[&Toolpath], mat: &Material) -> String {
     use std::fmt::Write;
+    let post = mat.post;
+    let inch = post.inch();
+    let k = if inch { 1.0 / 25.4 } else { 1.0 };
+    let dp = if inch { 4 } else { 3 };
     let (ox, oy) = match mat.origin {
         Origin::BottomLeft => (0.0, 0.0),
         Origin::Center => (mat.w * 0.5, mat.h * 0.5),
     };
     // Z values are generated relative to the material top; shift them when Z zero is the bed.
     let oz = if mat.z_bed { mat.thickness } else { 0.0 };
-    let safe = mat.safe_z + oz;
+    let n = |v: f32| format!("{:.*}", dp, v * k);
+    let xy = |x: f32, y: f32| format!("X{} Y{}", n(x - ox), n(y - oy));
+    let zz = |z: f32| format!("Z{}", n(z + oz));
+    let safe = zz(mat.safe_z);
+    let feed = |f: f32| format!("F{:.1}", f * k);
     let mut s = String::new();
-    let _ = writeln!(s, "( CarveCraft G-code, units mm )");
-    let zero = if mat.z_bed { "machine bed" } else { "material surface" };
-    let _ = writeln!(s, "( Material {:.2} x {:.2} x {:.2}, Z zero on {zero} )", mat.w, mat.h, mat.thickness);
-    let _ = writeln!(s, "G21 G90 G17 G94");
-    let _ = writeln!(s, "G0 Z{:.3}", safe);
+    let _ = writeln!(s, "( CarveCraft Studio · {} )", post.label());
+    let _ = writeln!(s, "( Material {:.2} x {:.2} x {:.2} mm, Z zero on the {} )", mat.w, mat.h, mat.thickness, if mat.z_bed { "machine bed" } else { "material surface" });
+    for tp in paths {
+        let _ = writeln!(s, "( {} – {} Ø{} mm, tool #{} )", tp.name, tp.tool.name, tp.tool.diameter, tp.tool.number);
+    }
+    let _ = writeln!(s, "{} G90 G17 G94", if inch { "G20" } else { "G21" });
+    if !matches!(post, Post::GrblMm | Post::GrblInch) {
+        let _ = writeln!(s, "G40 G49 G80");
+    }
+    if post == Post::LinuxCncMm {
+        // path blending tolerance: stay within 0.01 mm of the programmed path
+        let _ = writeln!(s, "G64 P0.01");
+    }
+    let _ = writeln!(s, "G0 {safe}");
     let mut last_tool = u32::MAX;
     for tp in paths {
-        let _ = writeln!(s, "( Toolpath: {} - {} )", tp.name, tp.tool.name);
+        let _ = writeln!(s, "( Toolpath: {} )", tp.name);
         if tp.tool.number != last_tool {
-            let _ = writeln!(s, "M5\nT{} M6\nS{:.0} M3", tp.tool.number, tp.tool.rpm);
+            let _ = writeln!(s, "M5");
+            if post.tool_change() {
+                let _ = writeln!(s, "T{} M6", tp.tool.number);
+            } else {
+                let _ = writeln!(s, "( Change to tool #{}: {} – resume when ready )\nM0", tp.tool.number, tp.tool.name);
+            }
+            let _ = writeln!(s, "S{:.0} M3", tp.tool.rpm);
             last_tool = tp.tool.number;
         }
         for ch in tp.chains.iter() {
             let Some(f) = ch.first() else { continue };
-            let _ = writeln!(s, "G0 Z{:.3}", safe);
-            let _ = writeln!(s, "G0 X{:.3} Y{:.3}", f[0] - ox, f[1] - oy);
-            let _ = writeln!(s, "G1 Z{:.3} F{:.0}", f[2] + oz, tp.tool.plunge);
+            let _ = writeln!(s, "G0 {safe}");
+            let _ = writeln!(s, "G0 {}", xy(f[0], f[1]));
+            let _ = writeln!(s, "G1 {} {}", zz(f[2]), feed(tp.tool.plunge));
             let mut first = true;
-            for p in ch.iter().skip(1) {
-                if first {
-                    let _ = writeln!(s, "G1 X{:.3} Y{:.3} Z{:.3} F{:.0}", p[0] - ox, p[1] - oy, p[2] + oz, tp.tool.feed);
-                    first = false;
-                } else {
-                    let _ = writeln!(s, "X{:.3} Y{:.3} Z{:.3}", p[0] - ox, p[1] - oy, p[2] + oz);
+            let mut at = *f;
+            for m in cam::fit_arcs(ch, 0.005) {
+                let f_word = if first { format!(" {}", feed(tp.tool.feed)) } else { String::new() };
+                match m {
+                    cam::Move::Line(p) => {
+                        let _ = writeln!(s, "G1 {} {}{f_word}", xy(p[0], p[1]), zz(p[2]));
+                        at = p;
+                    }
+                    cam::Move::Arc { end, centre, cw } => {
+                        // I and J are measured from the arc's start point.
+                        let _ = writeln!(s, "{} {} {} I{} J{}{f_word}", if cw { "G2" } else { "G3" }, xy(end[0], end[1]), zz(end[2]), n(centre.x - at[0]), n(centre.y - at[1]));
+                        at = end;
+                    }
                 }
+                first = false;
             }
         }
-        let _ = writeln!(s, "G0 Z{:.3}", safe);
+        let _ = writeln!(s, "G0 {safe}");
     }
-    let _ = writeln!(s, "M5\nG0 X{:.3} Y{:.3}\nM30", -ox, -oy);
+    let _ = writeln!(s, "M5\nG0 {}\nM30", xy(ox, oy));
     s
 }
 
@@ -715,9 +794,9 @@ mod tests {
         let tools = Tool::defaults();
         let cases = [
             (Op::VCarve { flat_depth: 0.0 }, &tools[4], &text),
-            (Op::Pocket { depth: 3.0, raster: true }, &tools[1], &circle),
-            (Op::Pocket { depth: 3.0, raster: false }, &tools[1], &circle),
-            (Op::Profile { depth: 6.0, side: Side::Inside }, &tools[0], &circle),
+            (Op::pocket(3.0, true), &tools[1], &circle),
+            (Op::pocket(3.0, false), &tools[1], &circle),
+            (Op::profile(6.0, Side::Inside), &tools[0], &circle),
             (Op::Drill { depth: 6.0 }, &tools[0], &circle),
             (Op::Fluting { depth: 2.0 }, &tools[2], &circle),
         ];
@@ -730,5 +809,165 @@ mod tests {
             let deepest = ch.iter().flatten().map(|p| p[2]).fold(0.0f32, f32::min);
             assert!(deepest < 0.0, "{} never cuts", op.label());
         }
+    }
+}
+
+#[cfg(test)]
+mod accuracy_tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Vec<Poly> {
+        vec![Poly { pts: vec![pos2(x, y), pos2(x + w, y), pos2(x + w, y + h), pos2(x, y + h)], closed: true }]
+    }
+
+    fn tool(dia: f32) -> Tool {
+        let mut t = Tool::defaults()[0].clone();
+        t.diameter = dia;
+        t.pass_depth = 3.0;
+        t.stepover = dia * 0.4;
+        t
+    }
+
+    fn empty_model(mat: &Material) -> Model {
+        let mut m = Model::new(mat.w, mat.h);
+        m.rebuild();
+        m
+    }
+
+    #[test]
+    fn outside_profile_is_exactly_one_radius_off_and_climbs() {
+        let mat = Material::default();
+        let model = empty_model(&mat);
+        let part = rect(50.0, 50.0, 100.0, 50.0);
+        let ch = generate(&Op::profile(6.0, Side::Outside), &tool(6.0), &part, &model, &mat);
+        assert_eq!(ch.len(), 2, "two 3 mm passes");
+        for c in &ch {
+            for p in c {
+                let d = geom::dist_to_polys(pos2(p[0], p[1]), &part);
+                assert!((d - 3.0).abs() < 0.003, "tool centre {d} mm from the part");
+            }
+        }
+        let loop_pts: Vec<Pos2> = ch[0].iter().map(|p| pos2(p[0], p[1])).collect();
+        assert!(geom::signed_area(&loop_pts) < 0.0, "climb on an outside cut runs clockwise");
+        assert_eq!(ch[1].iter().map(|p| p[2]).fold(0.0, f32::min), -6.0);
+    }
+
+    #[test]
+    fn inside_profile_with_allowance() {
+        let mat = Material::default();
+        let model = empty_model(&mat);
+        let hole = rect(50.0, 50.0, 60.0, 40.0);
+        let mut op = Op::profile(3.0, Side::Inside);
+        if let Op::Profile { allowance, .. } = &mut op {
+            *allowance = 0.5;
+        }
+        let ch = generate(&op, &tool(6.0), &hole, &model, &mat);
+        for p in &ch[0] {
+            let d = geom::dist_to_polys(pos2(p[0], p[1]), &hole);
+            assert!((d - 3.5).abs() < 0.003, "3 mm radius + 0.5 mm allowance, got {d}");
+        }
+    }
+
+    #[test]
+    fn tabs_only_on_passes_below_the_tab() {
+        let mat = Material::default();
+        let model = empty_model(&mat);
+        let part = rect(50.0, 50.0, 100.0, 50.0);
+        let mut op = Op::profile(9.0, Side::Outside);
+        if let Op::Profile { tabs, .. } = &mut op {
+            *tabs = cam::Tabs { on: true, count: 4, length: 8.0, thickness: 4.0 };
+        }
+        let ch = generate(&op, &tool(6.0), &part, &model, &mat);
+        assert_eq!(ch.len(), 3);
+        let top = |c: &Vec<[f32; 3]>| c.iter().map(|p| p[2]).fold(f32::MIN, f32::max);
+        assert!((top(&ch[0]) + 3.0).abs() < 1e-4, "first pass (-3) is above the tab top (-5): no lift");
+        assert!((top(&ch[2]) + 5.0).abs() < 1e-3, "last pass rides up to the tab top");
+    }
+
+    #[test]
+    fn offset_pocket_stays_inside_and_leaves_nothing() {
+        let mat = Material::default();
+        let model = empty_model(&mat);
+        let shape = rect(50.0, 50.0, 60.0, 40.0);
+        let t = tool(6.0);
+        for raster in [false, true] {
+            let ch = generate(&Op::pocket(3.0, raster), &t, &shape, &model, &mat);
+            // never closer to the wall than the tool radius
+            for c in &ch {
+                for p in c {
+                    let q = pos2(p[0], p[1]);
+                    assert!(geom::point_inside(q, &shape));
+                    assert!(geom::dist_to_polys(q, &shape) > 3.0 - 0.003);
+                }
+            }
+            // every spot of the pocket is within the cutter's reach of some move
+            let mut worst: f32 = 0.0;
+            for i in 0..=60 {
+                for j in 0..=40 {
+                    let q = pos2(50.0 + i as f32, 50.0 + j as f32);
+                    let d = ch.iter().flat_map(|c| c.windows(2)).map(|w| geom::seg_dist(q, pos2(w[0][0], w[0][1]), pos2(w[1][0], w[1][1]))).fold(f32::MAX, f32::min);
+                    // A round cutter can't reach the very corners: only check spots within one
+                    // radius of where its centre may go (the pocket shrunk by the radius).
+                    let centre_area = Rect::from_min_max(pos2(53.0, 53.0), pos2(107.0, 87.0));
+                    let reach = (q - centre_area.clamp(q)).length();
+                    if reach <= 3.0 - 1e-3 {
+                        worst = worst.max(d);
+                    }
+                }
+            }
+            assert!(worst <= 3.0 + 1e-3, "an uncut spot {worst} mm from the nearest move (raster={raster})");
+            assert!(ch.len() <= 2, "passes are linked without lifting (raster={raster}, {} chains)", ch.len());
+        }
+    }
+
+    /// Replay G-code (G0/G1/G2/G3, absolute, relative I/J) and return every position reached.
+    fn replay(code: &str) -> Vec<[f32; 3]> {
+        let mut at = [0.0f32; 3];
+        let mut out = Vec::new();
+        for line in code.lines() {
+            let words: Vec<&str> = line.split_whitespace().filter(|w| !w.starts_with('(')).collect();
+            if line.trim_start().starts_with('(') || words.is_empty() {
+                continue;
+            }
+            let get = |c: char| words.iter().find(|w| w.starts_with(c)).and_then(|w| w[1..].parse::<f32>().ok());
+            let g = words[0];
+            if !["G0", "G1", "G2", "G3"].contains(&g) {
+                continue;
+            }
+            let end = [get('X').unwrap_or(at[0]), get('Y').unwrap_or(at[1]), get('Z').unwrap_or(at[2])];
+            if g == "G2" || g == "G3" {
+                let c = (at[0] + get('I').unwrap(), at[1] + get('J').unwrap());
+                let r0 = ((at[0] - c.0).powi(2) + (at[1] - c.1).powi(2)).sqrt();
+                let r1 = ((end[0] - c.0).powi(2) + (end[1] - c.1).powi(2)).sqrt();
+                assert!((r0 - r1).abs() < 0.003, "arc start and end are on one circle: {line}");
+            }
+            at = end;
+            out.push(at);
+        }
+        out
+    }
+
+    #[test]
+    fn gcode_arcs_land_on_the_path_in_mm_and_inch() {
+        let mut mat = Material::default();
+        let model = empty_model(&mat);
+        let part = rect(50.0, 50.0, 100.0, 50.0);
+        let mut tp = Toolpath { id: 1, name: "Profile".into(), op: Op::profile(3.0, Side::Outside), tool: tool(6.0), polys: part.clone(), visible: true, chains: Arc::new(Vec::new()), length: 0.0, minutes: 0.0 };
+        tp.calculate(&model, &mat);
+        let code = gcode(&[&tp], &mat);
+        assert!(code.contains("G21"));
+        assert!(code.lines().any(|l| l.starts_with("G2 ")), "rounded corners come out as arcs");
+        let lines_mm = code.lines().count();
+        // every replayed cutting position is exactly one radius from the part
+        for p in replay(&code).iter().filter(|p| p[2] < 0.0) {
+            let d = geom::dist_to_polys(pos2(p[0], p[1]), &part);
+            assert!((d - 3.0).abs() < 0.01, "{p:?} is {d} mm from the part");
+        }
+        mat.post = Post::Mach3Inch;
+        let inch = gcode(&[&tp], &mat);
+        assert!(inch.contains("G20") && inch.contains("T1 M6"));
+        let far = replay(&inch).iter().map(|p| p[0]).fold(0.0, f32::max);
+        assert!((far - 153.0 / 25.4).abs() < 0.001, "right edge 153 mm = {} in, got {far}", 153.0 / 25.4);
+        assert!(lines_mm < 60, "arcs keep the file short ({lines_mm} lines)");
     }
 }

@@ -68,8 +68,8 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 let ops = [
-                    ("profile", Op::Profile { depth: 6.0, side: Side::Outside }, 0usize, "Profile – cut around or along vectors"),
-                    ("pocket", Op::Pocket { depth: 3.0, raster: true }, 0, "Pocket – clear out the inside of shapes"),
+                    ("profile", Op::profile(6.0, Side::Outside), 0usize, "Profile – cut around or along vectors"),
+                    ("pocket", Op::pocket(3.0, true), 0, "Pocket – clear out the inside of shapes"),
                     ("drill", Op::Drill { depth: 8.0 }, 0, "Drilling – holes at the centre of shapes"),
                     ("vcarve", Op::VCarve { flat_depth: 0.0 }, 4, "V-Carve – sharp V-grooves, ideal for lettering"),
                     ("engrave", Op::Engrave { depth: 1.0 }, 6, "Quick engrave – trace vectors at a fixed depth"),
@@ -159,20 +159,58 @@ impl App {
         accent_card(ui, dark, |ui| {
             ui.label(RichText::new(format!("{} toolpath", op.label())).strong().size(15.0));
             match op {
-                Op::Profile { depth, side } => {
+                Op::Profile { depth, side, start, allowance, climb, tabs, ramp } => {
+                    ui.label(RichText::new("Cutting depths").strong());
+                    num(ui, "Start depth", start, 0.0..=200.0, " mm");
                     num(ui, "Cut depth", depth, 0.1..=200.0, " mm");
+                    ui.label(RichText::new("Machine vectors").strong());
                     ui.horizontal(|ui| {
                         ui.radio_value(side, Side::Outside, "Outside");
                         ui.radio_value(side, Side::Inside, "Inside");
                         ui.radio_value(side, Side::On, "On");
                     });
+                    ui.horizontal(|ui| {
+                        ui.radio_value(climb, true, "Climb");
+                        ui.radio_value(climb, false, "Conventional");
+                    });
+                    num(ui, "Allowance", allowance, -20.0..=20.0, " mm").on_hover_text("Leave this much extra material on the wall for a finishing pass");
+                    ui.horizontal(|ui| {
+                        let mut on = *ramp > 0.0;
+                        if ui.checkbox(&mut on, "Ramp plunge moves").changed() {
+                            *ramp = if on { 10.0 } else { 0.0 };
+                        }
+                        if on {
+                            ui.add(egui::DragValue::new(ramp).range(0.5..=200.0).speed(0.2).suffix(" mm"));
+                        }
+                    });
+                    ui.checkbox(&mut tabs.on, "Add tabs");
+                    if tabs.on {
+                        egui::Grid::new("tabs").num_columns(2).show(ui, |ui| {
+                            ui.label("Number");
+                            ui.add(egui::DragValue::new(&mut tabs.count).range(1..=50));
+                            ui.end_row();
+                            ui.label("Length");
+                            ui.add(egui::DragValue::new(&mut tabs.length).range(1.0..=100.0).speed(0.1).suffix(" mm"));
+                            ui.end_row();
+                            ui.label("Thickness");
+                            ui.add(egui::DragValue::new(&mut tabs.thickness).range(0.2..=50.0).speed(0.1).suffix(" mm"));
+                            ui.end_row();
+                        });
+                    }
                 }
-                Op::Pocket { depth, raster } => {
+                Op::Pocket { depth, raster, start, allowance, climb } => {
+                    ui.label(RichText::new("Cutting depths").strong());
+                    num(ui, "Start depth", start, 0.0..=200.0, " mm");
                     num(ui, "Cut depth", depth, 0.1..=200.0, " mm");
                     ui.horizontal(|ui| {
-                        ui.radio_value(raster, true, "Raster");
                         ui.radio_value(raster, false, "Offset");
+                        ui.radio_value(raster, true, "Raster");
                     });
+                    ui.horizontal(|ui| {
+                        ui.radio_value(climb, true, "Climb");
+                        ui.radio_value(climb, false, "Conventional");
+                    });
+                    num(ui, "Pocket allowance", allowance, -20.0..=20.0, " mm");
                 }
                 Op::Drill { depth } => {
                     num(ui, "Hole depth", depth, 0.1..=200.0, " mm");
@@ -337,6 +375,14 @@ impl App {
                 ui.checkbox(&mut self.show_sim, "Show cut material in 3D view");
             }
             ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Machine");
+                egui::ComboBox::from_id_salt("post").width(170.0).selected_text(self.doc.material.post.label()).show_ui(ui, |ui| {
+                    for p in crate::cam::Post::ALL {
+                        ui.selectable_value(&mut self.doc.material.post, p, p.label());
+                    }
+                });
+            });
             if ui.add(egui::Button::new("💾 Save ticked toolpaths as G-code…").min_size(vec2(ui.available_width(), 28.0))).clicked() {
                 cmd = Some("save");
             }
@@ -393,7 +439,7 @@ pub fn sample_doc() -> Doc {
         d.toolpaths.push(t);
     };
     tp(&mut d, "3D Finishing", Op::Finish3D, &tools[2], Vec::new(), false);
-    tp(&mut d, "Profile cut-out", Op::Profile { depth: 20.0, side: Side::Outside }, &tools[0], plate.polys(), true);
+    tp(&mut d, "Profile cut-out", Op::profile(20.0, Side::Outside), &tools[0], plate.polys(), true);
     d
 }
 

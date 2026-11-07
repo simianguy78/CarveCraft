@@ -1,4 +1,5 @@
 mod app;
+mod cam;
 mod geom;
 mod icons;
 mod model;

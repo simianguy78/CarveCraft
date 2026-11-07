@@ -351,6 +351,15 @@ impl App {
                 "design" => app.left_tab = LeftTab::Design,
                 "light" => app.dark = false,
                 "rotate" => app.script_rotate = true,
+                "profile" => {
+                    let mut op = Op::profile(6.0, crate::toolpath::Side::Outside);
+                    if let Op::Profile { tabs, ramp, .. } = &mut op {
+                        tabs.on = true;
+                        *ramp = 10.0;
+                    }
+                    app.pending_op = Some(op);
+                    app.tool_idx = 0;
+                }
                 "dense" => {
                     // Node-edit the rounded plaque outline: lots of short segments.
                     app.tool = DrawTool::Node;
@@ -590,7 +599,7 @@ impl App {
             return;
         }
         let code = toolpath::gcode(&paths, &self.doc.material);
-        if let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["nc", "gcode", "tap"]).set_file_name(format!("{}.nc", self.doc.name)).save_file() {
+        if let Some(path) = rfd::FileDialog::new().add_filter("G-code", &[self.doc.material.post.extension(), "nc", "gcode", "tap", "ngc"]).set_file_name(format!("{}.{}", self.doc.name, self.doc.material.post.extension())).save_file() {
             match std::fs::write(&path, code) {
                 Ok(()) => self.toast(format!("G-code saved to {}", path.display())),
                 Err(e) => self.toast(format!("Could not save G-code: {e}")),

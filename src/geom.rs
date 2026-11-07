@@ -641,11 +641,58 @@ pub fn simplify(pts: &[Pos2], tol: f32) -> Vec<Pos2> {
 }
 
 /// Offset closed outlines: positive = outward, negative = inward.
+///
+/// Exact (Clipper2): corners that grow get round arcs within 0.002 mm, corners that shrink stay
+/// sharp, and overlapping or self-touching results are merged cleanly.
 pub fn offset_polys(polys: &[Poly], offset: f32) -> Vec<Poly> {
-    let b = bounds_of(polys);
-    let cell = ((b.width().max(b.height()) + 2.0 * offset.abs()) / 500.0).clamp(0.05, 1.0);
-    let field = Field::build(polys, cell, offset.abs() + cell * 3.0);
-    field.contours(-offset).into_iter().map(|pts| Poly { pts, closed: true }).collect()
+    use clipper2_rust::{inflate_paths_d, EndType, JoinType};
+    let region = region_paths(polys);
+    if offset.abs() < 1e-6 {
+        return paths_to_polys(&region);
+    }
+    let out = inflate_paths_d(&region, offset as f64, JoinType::Round, EndType::Polygon, 2.0, CLIP_PRECISION, ARC_TOLERANCE);
+    paths_to_polys(&out)
+}
+
+/// Decimal places Clipper2 keeps (0.0001 mm).
+const CLIP_PRECISION: i32 = 4;
+/// Largest gap between a rounded offset corner and the true arc, in mm.
+pub const ARC_TOLERANCE: f64 = 0.002;
+
+fn polys_to_paths(polys: &[Poly]) -> clipper2_rust::PathsD {
+    polys
+        .iter()
+        .filter(|p| p.closed && p.pts.len() >= 3)
+        .map(|p| p.pts.iter().map(|q| clipper2_rust::Point::new(q.x as f64, q.y as f64)).collect())
+        .collect()
+}
+
+fn paths_to_polys(paths: &clipper2_rust::PathsD) -> Vec<Poly> {
+    paths
+        .iter()
+        .filter(|p| p.len() >= 3)
+        .map(|p| Poly { pts: p.iter().map(|q| pos2(q.x as f32, q.y as f32)).collect(), closed: true })
+        .collect()
+}
+
+/// The area enclosed by closed outlines (even-odd, so letters' holes stay holes), as clean
+/// outlines: outer edges counter-clockwise, holes clockwise.
+fn region_paths(polys: &[Poly]) -> clipper2_rust::PathsD {
+    clipper2_rust::union_d(&polys_to_paths(polys), &clipper2_rust::PathsD::new(), clipper2_rust::FillRule::EvenOdd, CLIP_PRECISION)
+}
+
+/// [`region_paths`] as outlines.
+pub fn region_polys(polys: &[Poly]) -> Vec<Poly> {
+    paths_to_polys(&region_paths(polys))
+}
+
+/// Signed area: positive when the points run counter-clockwise.
+pub fn signed_area(pts: &[Pos2]) -> f32 {
+    let n = pts.len();
+    (0..n).map(|i| {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        a.x * b.y - b.x * a.y
+    }).sum::<f32>() * 0.5
 }
 
 // ---------------------------------------------------------------- text
@@ -1183,5 +1230,49 @@ mod constraint_tests {
         assert_eq!(Constraint::Fixed(3).after_remove(1, 5, true), Some(Constraint::Fixed(2)));
         assert_eq!(Constraint::Vertical(0).after_remove(1, 5, true), None); // merged away
         assert_eq!(Constraint::Vertical(3).after_remove(1, 5, true), Some(Constraint::Vertical(2)));
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    fn rect(w: f32, h: f32) -> Vec<Poly> {
+        vec![Poly { pts: vec![pos2(0.0, 0.0), pos2(w, 0.0), pos2(w, h), pos2(0.0, h)], closed: true }]
+    }
+
+    #[test]
+    fn outward_offset_is_exact_with_round_corners() {
+        let out = offset_polys(&rect(100.0, 50.0), 3.0);
+        assert_eq!(out.len(), 1);
+        let b = bounds_of(&out);
+        assert!((b.width() - 106.0).abs() < 0.002 && (b.height() - 56.0).abs() < 0.002, "{b:?}");
+        // every point is exactly 3 mm from the rectangle (round corners, not chamfers)
+        let src = rect(100.0, 50.0);
+        for p in &out[0].pts {
+            let d = dist_to_polys(*p, &src);
+            assert!((d - 3.0).abs() < 0.003, "point {p:?} is {d} mm away");
+        }
+    }
+
+    #[test]
+    fn inward_offset_keeps_sharp_corners() {
+        let inn = offset_polys(&rect(100.0, 50.0), -3.0);
+        assert_eq!(inn.len(), 1);
+        let b = bounds_of(&inn);
+        assert!((b.width() - 94.0).abs() < 0.002 && (b.height() - 44.0).abs() < 0.002);
+        assert_eq!(inn[0].pts.len(), 4, "a shrunk rectangle is still four sharp corners");
+    }
+
+    #[test]
+    fn holes_offset_the_other_way() {
+        // A frame: 100 mm square with a 60 mm square hole.
+        let mut f = rect(100.0, 100.0);
+        f.push(Poly { pts: vec![pos2(20.0, 20.0), pos2(80.0, 20.0), pos2(80.0, 80.0), pos2(20.0, 80.0)], closed: true });
+        let out = offset_polys(&f, 2.0);
+        assert_eq!(out.len(), 2);
+        let hole = out.iter().find(|p| signed_area(&p.pts) < 0.0).expect("hole stays a hole");
+        let hb = bounds_of(std::slice::from_ref(hole));
+        assert!((hb.width() - 56.0).abs() < 0.002, "the hole shrinks as the frame grows: {hb:?}");
     }
 }
