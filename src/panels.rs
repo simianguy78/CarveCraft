@@ -166,7 +166,7 @@ impl App {
                 self.export_stl();
                 ui.close_menu();
             }
-            if ui.button("Save toolpaths as G-code…").clicked() {
+            if ui.button("Save Toolpaths…").clicked() {
                 self.export_gcode(None);
                 ui.close_menu();
             }
@@ -284,7 +284,7 @@ impl App {
                 self.start_sim(true);
                 ui.close_menu();
             }
-            if ui.button("Save toolpaths as G-code…").clicked() {
+            if ui.button("Save Toolpaths…").clicked() {
                 self.export_gcode(None);
                 ui.close_menu();
             }

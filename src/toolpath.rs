@@ -26,11 +26,34 @@ pub struct Material {
     /// Which machine controller the G-code is written for.
     #[serde(default)]
     pub post: Post,
+    /// G-code output options.
+    #[serde(default)]
+    pub gcode: GcodeOpts,
+}
+
+/// Options for writing G-code.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GcodeOpts {
+    /// Seconds to wait after starting the spindle, so it reaches speed before cutting.
+    pub dwell: f32,
+    /// Go back to X0 Y0 (above the material) at the end; otherwise just lift to safe Z.
+    pub end_home: bool,
+    /// Number every line (N10, N20…), which some controllers like.
+    pub line_numbers: bool,
+    /// Leave out axis words that don't change, for smaller files.
+    pub compact: bool,
+}
+
+impl Default for GcodeOpts {
+    fn default() -> Self {
+        GcodeOpts { dwell: 2.0, end_home: true, line_numbers: false, compact: true }
+    }
 }
 
 impl Default for Material {
     fn default() -> Self {
-        Self { w: 300.0, h: 200.0, thickness: 20.0, origin: Origin::BottomLeft, safe_z: 5.0, z_bed: false, post: Post::default() }
+        Self { w: 300.0, h: 200.0, thickness: 20.0, origin: Origin::BottomLeft, safe_z: 5.0, z_bed: false, post: Post::default(), gcode: GcodeOpts::default() }
     }
 }
 
@@ -708,10 +731,12 @@ fn stamp(s: &mut Stock, k: &Kernel, p: [f32; 3]) {
 /// Write the toolpaths as G-code for the chosen machine (the material's post-processor).
 ///
 /// Every chain becomes: retract to safe Z, rapid over its start, feed down at the plunge rate,
-/// then cut at the feed rate. Level runs that follow a circle are written as G2/G3 arcs.
+/// then cut at the feed rate. A chain that starts where the last one ended continues without
+/// lifting. Level runs that follow a circle are written as G2/G3 arcs.
 pub fn gcode(paths: &[&Toolpath], mat: &Material) -> String {
     use std::fmt::Write;
     let post = mat.post;
+    let opts = &mat.gcode;
     let inch = post.inch();
     let k = if inch { 1.0 / 25.4 } else { 1.0 };
     let dp = if inch { 4 } else { 3 };
@@ -721,66 +746,211 @@ pub fn gcode(paths: &[&Toolpath], mat: &Material) -> String {
     };
     // Z values are generated relative to the material top; shift them when Z zero is the bed.
     let oz = if mat.z_bed { mat.thickness } else { 0.0 };
-    let n = |v: f32| format!("{:.*}", dp, v * k);
-    let xy = |x: f32, y: f32| format!("X{} Y{}", n(x - ox), n(y - oy));
-    let zz = |z: f32| format!("Z{}", n(z + oz));
-    let safe = zz(mat.safe_z);
+    let n = |v: f32| {
+        let t = format!("{:.*}", dp, v * k);
+        // "-0.000" reads oddly on a controller display
+        if t.trim_start_matches('-').chars().all(|c| c == '0' || c == '.') { format!("{:.*}", dp, 0.0) } else { t }
+    };
     let feed = |f: f32| format!("F{:.1}", f * k);
-    let mut s = String::new();
-    let _ = writeln!(s, "( CarveCraft Studio · {} )", post.label());
-    let _ = writeln!(s, "( Material {:.2} x {:.2} x {:.2} mm, Z zero on the {} )", mat.w, mat.h, mat.thickness, if mat.z_bed { "machine bed" } else { "material surface" });
+
+    let mut out = String::new();
+    let mut line_no = 0u32;
+    let mut emit = |out: &mut String, text: &str| {
+        for l in text.lines() {
+            if opts.line_numbers && !l.starts_with('(') {
+                line_no += 10;
+                let _ = writeln!(out, "N{line_no} {l}");
+            } else {
+                let _ = writeln!(out, "{l}");
+            }
+        }
+    };
+    // Last commanded position (machine units after offsets), to leave out unchanged words.
+    let mut at: [Option<String>; 3] = [None, None, None];
+    let mut last_f: Option<String> = None;
+    let mv = |code: &str, p: [f32; 3], f: Option<f32>, extra: &str, at: &mut [Option<String>; 3], last_f: &mut Option<String>| -> String {
+        let words = [format!("X{}", n(p[0] - ox)), format!("Y{}", n(p[1] - oy)), format!("Z{}", n(p[2] + oz))];
+        let mut line = code.to_string();
+        for (i, w) in words.iter().enumerate() {
+            let arc_needs_xy = extra.is_empty() || i == 2;
+            if !opts.compact || at[i].as_deref() != Some(w.as_str()) || !arc_needs_xy {
+                line.push(' ');
+                line.push_str(w);
+            }
+            at[i] = Some(w.clone());
+        }
+        line.push_str(extra);
+        if let Some(f) = f {
+            let fw = feed(f);
+            if !opts.compact || last_f.as_deref() != Some(fw.as_str()) {
+                line.push(' ');
+                line.push_str(&fw);
+                *last_f = Some(fw);
+            }
+        }
+        line
+    };
+    let safe_word = |at: &mut [Option<String>; 3]| {
+        let w = format!("Z{}", n(mat.safe_z + oz));
+        at[2] = Some(w.clone());
+        format!("G0 {w}")
+    };
+
+    emit(&mut out, &format!("( CarveCraft Studio · {} )", post.label()));
+    emit(&mut out, &format!("( Material {:.2} x {:.2} x {:.2} mm, Z zero on the {}, XY zero at the {} )", mat.w, mat.h, mat.thickness, if mat.z_bed { "machine bed" } else { "material surface" }, match mat.origin {
+        Origin::BottomLeft => "bottom-left corner",
+        Origin::Center => "centre",
+    }));
     for tp in paths {
-        let _ = writeln!(s, "( {} – {} Ø{} mm, tool #{} )", tp.name, tp.tool.name, tp.tool.diameter, tp.tool.number);
+        emit(&mut out, &format!("( {} – {} Ø{} mm, tool #{} )", tp.name, tp.tool.name, tp.tool.diameter, tp.tool.number));
     }
-    let _ = writeln!(s, "{} G90 G17 G94", if inch { "G20" } else { "G21" });
+    emit(&mut out, &format!("{} G90 G17 G94", if inch { "G20" } else { "G21" }));
     if !matches!(post, Post::GrblMm | Post::GrblInch) {
-        let _ = writeln!(s, "G40 G49 G80");
+        emit(&mut out, "G40 G49 G80");
     }
     if post == Post::LinuxCncMm {
         // path blending tolerance: stay within 0.01 mm of the programmed path
-        let _ = writeln!(s, "G64 P0.01");
+        emit(&mut out, "G64 P0.01");
     }
-    let _ = writeln!(s, "G0 {safe}");
+    let l = safe_word(&mut at);
+    emit(&mut out, &l);
     let mut last_tool = u32::MAX;
+    let mut last_end: Option<[f32; 3]> = None;
     for tp in paths {
-        let _ = writeln!(s, "( Toolpath: {} )", tp.name);
+        emit(&mut out, &format!("( Toolpath: {} )", tp.name));
         if tp.tool.number != last_tool {
-            let _ = writeln!(s, "M5");
+            emit(&mut out, "M5");
             if post.tool_change() {
-                let _ = writeln!(s, "T{} M6", tp.tool.number);
+                emit(&mut out, &format!("T{} M6", tp.tool.number));
             } else {
-                let _ = writeln!(s, "( Change to tool #{}: {} – resume when ready )\nM0", tp.tool.number, tp.tool.name);
+                emit(&mut out, &format!("( Change to tool #{}: {} – resume when ready )\nM0", tp.tool.number, tp.tool.name));
             }
-            let _ = writeln!(s, "S{:.0} M3", tp.tool.rpm);
+            emit(&mut out, &format!("S{:.0} M3", tp.tool.rpm));
+            if opts.dwell > 0.0 {
+                emit(&mut out, &format!("G4 P{:.1}", opts.dwell));
+            }
             last_tool = tp.tool.number;
+            last_end = None;
+            last_f = None;
         }
         for ch in tp.chains.iter() {
             let Some(f) = ch.first() else { continue };
-            let _ = writeln!(s, "G0 {safe}");
-            let _ = writeln!(s, "G0 {}", xy(f[0], f[1]));
-            let _ = writeln!(s, "G1 {} {}", zz(f[2]), feed(tp.tool.plunge));
+            // Carry on without lifting when this chain starts exactly where the last one ended.
+            let continues = last_end.is_some_and(|e| (e[0] - f[0]).abs() < 1e-4 && (e[1] - f[1]).abs() < 1e-4 && (e[2] - f[2]).abs() < 1e-4);
+            if !continues {
+                let l = safe_word(&mut at);
+                emit(&mut out, &l);
+                let l = mv("G0", [f[0], f[1], mat.safe_z], None, "", &mut at, &mut last_f);
+                emit(&mut out, &l);
+                let l = mv("G1", *f, Some(tp.tool.plunge), "", &mut at, &mut last_f);
+                emit(&mut out, &l);
+            }
+            let mut cur = *f;
             let mut first = true;
-            let mut at = *f;
             for m in cam::fit_arcs(ch, 0.005) {
-                let f_word = if first { format!(" {}", feed(tp.tool.feed)) } else { String::new() };
-                match m {
+                let fr = Some(tp.tool.feed);
+                let line = match m {
                     cam::Move::Line(p) => {
-                        let _ = writeln!(s, "G1 {} {}{f_word}", xy(p[0], p[1]), zz(p[2]));
-                        at = p;
+                        let l = mv("G1", p, fr, "", &mut at, &mut last_f);
+                        cur = p;
+                        l
                     }
                     cam::Move::Arc { end, centre, cw } => {
                         // I and J are measured from the arc's start point.
-                        let _ = writeln!(s, "{} {} {} I{} J{}{f_word}", if cw { "G2" } else { "G3" }, xy(end[0], end[1]), zz(end[2]), n(centre.x - at[0]), n(centre.y - at[1]));
-                        at = end;
+                        let ij = format!(" I{} J{}", n(centre.x - cur[0]), n(centre.y - cur[1]));
+                        let l = mv(if cw { "G2" } else { "G3" }, end, fr, &ij, &mut at, &mut last_f);
+                        cur = end;
+                        l
                     }
+                };
+                // the first cutting move always restates the feed (the plunge used another)
+                if first && !line.contains(" F") {
+                    emit(&mut out, &format!("{line} {}", feed(tp.tool.feed)));
+                    last_f = Some(feed(tp.tool.feed));
+                } else {
+                    emit(&mut out, &line);
                 }
                 first = false;
             }
+            last_end = Some(cur);
         }
-        let _ = writeln!(s, "G0 {safe}");
+        let l = safe_word(&mut at);
+        emit(&mut out, &l);
+        last_end = None;
     }
-    let _ = writeln!(s, "M5\nG0 {}\nM30", xy(ox, oy));
-    s
+    emit(&mut out, "M5");
+    if opts.end_home {
+        emit(&mut out, &format!("G0 X{} Y{}", n(0.0), n(0.0)));
+    }
+    emit(&mut out, "M30");
+    out
+}
+
+/// What a set of toolpaths will do, checked before saving.
+#[derive(Clone, Debug, Default)]
+pub struct GcodeReport {
+    pub minutes: f32,
+    pub cut_length: f32,
+    /// Lowest point any tool tip reaches, relative to the material top (mm).
+    pub deepest: f32,
+    /// Where tool centres travel (mm, job coordinates).
+    pub extents: Option<Rect>,
+    pub tools: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+pub fn check_gcode(paths: &[&Toolpath], mat: &Material) -> GcodeReport {
+    let mut r = GcodeReport { deepest: 0.0, ..Default::default() };
+    let mut ext = Rect::NOTHING;
+    for tp in paths {
+        r.minutes += tp.minutes;
+        r.cut_length += tp.length;
+        let label = format!("#{} {}", tp.tool.number, tp.tool.name);
+        if !r.tools.contains(&label) {
+            r.tools.push(label);
+        }
+        if tp.chains.is_empty() {
+            r.warnings.push(format!("“{}” has no moves – recalculate it", tp.name));
+        }
+        if tp.tool.feed <= 0.0 || tp.tool.plunge <= 0.0 || tp.tool.rpm <= 0.0 {
+            r.warnings.push(format!("“{}” has a zero feed, plunge or spindle speed", tp.name));
+        }
+        let mut below = false;
+        let mut outside = false;
+        for p in tp.chains.iter().flatten() {
+            ext.extend_with(pos2(p[0], p[1]));
+            r.deepest = r.deepest.min(p[2]);
+            below |= p[2] < -mat.thickness - 0.01;
+            let reach = tp.tool.radius() + 0.01;
+            outside |= p[0] < -reach || p[1] < -reach || p[0] > mat.w + reach || p[1] > mat.h + reach;
+        }
+        if below {
+            r.warnings.push(format!("“{}” cuts below the bottom of the material (into the spoilboard)", tp.name));
+        }
+        if outside {
+            r.warnings.push(format!("“{}” goes outside the material", tp.name));
+        }
+    }
+    let shared: Vec<u32> = {
+        let mut seen: Vec<(u32, String)> = Vec::new();
+        let mut clash = Vec::new();
+        for tp in paths {
+            match seen.iter().find(|(n, _)| *n == tp.tool.number) {
+                Some((_, name)) if *name != tp.tool.name => clash.push(tp.tool.number),
+                None => seen.push((tp.tool.number, tp.tool.name.clone())),
+                _ => {}
+            }
+        }
+        clash
+    };
+    for n in shared {
+        r.warnings.push(format!("Two different tools share tool number {n}"));
+    }
+    if mat.safe_z < 1.0 {
+        r.warnings.push("Safe Z is under 1 mm – the tool may drag across clamps".into());
+    }
+    r.extents = ext.is_positive().then_some(ext);
+    r
 }
 
 pub fn material_rect(mat: &Material) -> Rect {
@@ -987,5 +1157,83 @@ mod accuracy_tests {
         let far = replay(&inch).iter().map(|p| p[0]).fold(0.0, f32::max);
         assert!((far - 153.0 / 25.4).abs() < 0.001, "right edge 153 mm = {} in, got {far}", 153.0 / 25.4);
         assert!(lines_mm < 60, "arcs keep the file short ({lines_mm} lines)");
+    }
+}
+
+#[cfg(test)]
+mod gcode_output_tests {
+    use super::*;
+
+    fn job() -> (Toolpath, Material) {
+        let mat = Material::default();
+        let mut model = Model::new(mat.w, mat.h);
+        model.rebuild();
+        let mut tool = Tool::defaults()[0].clone();
+        tool.pass_depth = 3.0;
+        let square = vec![Poly { pts: vec![pos2(50.0, 50.0), pos2(150.0, 50.0), pos2(150.0, 100.0), pos2(50.0, 100.0)], closed: true }];
+        let mut tp = Toolpath { id: 1, name: "Profile".into(), op: Op::profile(6.0, Side::Outside), tool, polys: square, visible: true, chains: Arc::new(Vec::new()), length: 0.0, minutes: 0.0 };
+        tp.calculate(&model, &mat);
+        (tp, mat)
+    }
+
+    #[test]
+    fn options_change_the_output() {
+        let (tp, mut mat) = job();
+        mat.gcode.compact = false;
+        let full = gcode(&[&tp], &mat);
+        mat.gcode.compact = true;
+        let small = gcode(&[&tp], &mat);
+        assert!(small.len() < full.len(), "compact output is smaller");
+        assert!(!small.contains("-0.000"), "no negative zeros");
+        assert!(small.contains("G4 P2.0"), "spindle warm-up pause");
+        assert!(small.contains("G0 X0.000 Y0.000\nM30"), "returns home at the end");
+        mat.gcode.line_numbers = true;
+        mat.gcode.dwell = 0.0;
+        mat.gcode.end_home = false;
+        let numbered = gcode(&[&tp], &mat);
+        assert!(numbered.lines().any(|l| l.starts_with("N10 ")));
+        assert!(!numbered.contains("G4 "));
+        assert!(!numbered.contains("Y0.000\nN"), "no trip home");
+    }
+
+    #[test]
+    fn same_cut_whatever_the_options() {
+        // Replay the moves: compact and full output must reach the same points.
+        let (tp, mut mat) = job();
+        let ends = |code: &str| -> Vec<[String; 3]> {
+            let mut at = [String::new(), String::new(), String::new()];
+            let mut out = Vec::new();
+            for l in code.lines().filter(|l| l.starts_with('G')) {
+                for w in l.split_whitespace() {
+                    let i = match w.chars().next() {
+                        Some('X') => 0,
+                        Some('Y') => 1,
+                        Some('Z') => 2,
+                        _ => continue,
+                    };
+                    at[i] = w[1..].to_string();
+                }
+                out.push(at.clone());
+            }
+            out
+        };
+        mat.gcode.compact = false;
+        let a = ends(&gcode(&[&tp], &mat));
+        mat.gcode.compact = true;
+        let b = ends(&gcode(&[&tp], &mat));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn check_warns_about_cutting_through_the_bed() {
+        let (mut tp, mat) = job();
+        let mut ch = (*tp.chains).clone();
+        ch[0][0][2] = -mat.thickness - 2.0;
+        tp.chains = Arc::new(ch);
+        let r = check_gcode(&[&tp], &mat);
+        assert!(r.warnings.iter().any(|w| w.contains("below the bottom")), "{:?}", r.warnings);
+        assert!(r.deepest <= -mat.thickness - 2.0 + 1e-4);
+        let (ok, mat) = job();
+        assert!(check_gcode(&[&ok], &mat).warnings.is_empty());
     }
 }

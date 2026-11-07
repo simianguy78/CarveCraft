@@ -236,6 +236,9 @@ pub struct App {
     pub sim_running: bool,
     pub sim_speed: f32,
     pub show_tool_db: bool,
+    pub show_export: bool,
+    pub export_pick: Vec<u64>,
+    pub export_split: bool,
     pub tool_materials: Vec<String>,
     pub tool_material: String,
     pub db_sel: usize,
@@ -312,6 +315,9 @@ impl App {
             sim_running: false,
             sim_speed: 3.2,
             show_tool_db: false,
+            show_export: false,
+            export_pick: Vec::new(),
+            export_split: false,
             tool_materials: Vec::new(),
             tool_material: String::new(),
             db_sel: 0,
@@ -364,6 +370,7 @@ impl App {
                 "design" => app.left_tab = LeftTab::Design,
                 "light" => app.dark = false,
                 "rotate" => app.script_rotate = true,
+                "export" => app.open_export(None),
                 "tooldb" => {
                     app.show_tool_db = true;
                     app.db_sel = app.tool_idx;
@@ -606,22 +613,9 @@ impl App {
         }
     }
 
+    /// Open the Save Toolpaths window (one toolpath, or every visible one).
     pub fn export_gcode(&mut self, only: Option<usize>) {
-        let paths: Vec<&Toolpath> = match only {
-            Some(i) => self.doc.toolpaths.get(i).into_iter().collect(),
-            None => self.doc.toolpaths.iter().filter(|t| t.visible).collect(),
-        };
-        if paths.is_empty() {
-            self.toast("No toolpaths to save – calculate one first");
-            return;
-        }
-        let code = toolpath::gcode(&paths, &self.doc.material);
-        if let Some(path) = rfd::FileDialog::new().add_filter("G-code", &[self.doc.material.post.extension(), "nc", "gcode", "tap", "ngc"]).set_file_name(format!("{}.{}", self.doc.name, self.doc.material.post.extension())).save_file() {
-            match std::fs::write(&path, code) {
-                Ok(()) => self.toast(format!("G-code saved to {}", path.display())),
-                Err(e) => self.toast(format!("Could not save G-code: {e}")),
-            }
-        }
+        self.open_export(only);
     }
 
     pub fn export_stl(&mut self) {
@@ -1209,6 +1203,7 @@ impl eframe::App for App {
         let fill = ctx.style().visuals.panel_fill;
         self.guide_window(ctx);
         self.tool_db_window(ctx);
+        self.export_window(ctx);
         if self.home {
             egui::SidePanel::left("start")
                 .exact_width(304.0)

@@ -390,7 +390,7 @@ impl App {
                     }
                 });
             });
-            if ui.add(egui::Button::new("💾 Save ticked toolpaths as G-code…").min_size(vec2(ui.available_width(), 28.0))).clicked() {
+            if ui.add(egui::Button::new("💾 Save Toolpaths…").min_size(vec2(ui.available_width(), 28.0))).clicked() {
                 cmd = Some("save");
             }
         });

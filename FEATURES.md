@@ -66,7 +66,7 @@ the code in this repository.
 | Saved tool library with per-material settings | ✅ | ✅ | ✅ (groups, notes, materials, import/export) |
 | Material setup: size, thickness, Z zero top / bed | ✅ | ✅ | ✅ |
 | XY datum: corners, centre, offset | ✅ | ✅ | 🟡 (bottom-left or centre) |
-| Safe Z and home position | ✅ | ✅ | 🟡 (safe Z; returns to the origin at the end) |
+| Safe Z and home position | ✅ | ✅ | ✅ (safe Z; return home or stay; spindle warm-up) |
 | Toolpath list: show/hide, reorder, recalculate | ✅ | ✅ | ✅ |
 | Toolpath templates, copy, merge | ✅ | ✅ | ❌ |
 | Toolpath summary / machining time estimate | ✅ | ✅ | 🟡 (time estimate per toolpath) |
@@ -74,7 +74,7 @@ the code in this repository.
 | Preview: per-toolpath colours, wood textures | ✅ | ✅ | 🟡 (one wood colour) |
 | Post-processors | ✅ (hundreds) | ✅ (hundreds) | 🟡 (GRBL, Mach3/UCCNC, LinuxCNC; mm or inch) |
 | Arc output (G2/G3) | ✅ | ✅ | ✅ |
-| Save toolpaths together or one file per tool | ✅ | ✅ | 🟡 (all ticked, or one toolpath at a time) |
+| Save toolpaths together or one file per tool | ✅ | ✅ | ✅ (with G-code preview and safety check) |
 | Toolpath tiling (jobs larger than the machine) | ✅ | ✅ | ❌ |
 | Sheets and nesting | ✅ | ✅ | ❌ |
 | Direct output to machine (send G-code) | ✅ | ✅ | ❌ |
