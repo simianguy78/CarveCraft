@@ -1331,3 +1331,69 @@ mod datum_tests {
         assert_eq!((o.origin, o.resolution, o.inches), (Origin::Center, Resolution::High, false));
     }
 }
+
+#[cfg(test)]
+mod job_setup_effects {
+    use super::*;
+
+    /// First rapid "G0 X.. Y..", first "G1 Z" plunge and first "G0 Z" of a file, as numbers.
+    fn first_moves(code: &str) -> ((f32, f32), f32, f32) {
+        let num = |l: &str, axis: char| l.split_whitespace().find(|w| w.starts_with(axis)).map(|w| w[1..].parse::<f32>().unwrap());
+        let rapid = code.lines().find(|l| l.starts_with("G0 X")).unwrap();
+        let plunge = code.lines().find(|l| l.starts_with("G1 Z")).unwrap();
+        let safe = code.lines().find(|l| l.starts_with("G0 Z")).unwrap();
+        ((num(rapid, 'X').unwrap(), num(rapid, 'Y').unwrap()), num(plunge, 'Z').unwrap(), num(safe, 'Z').unwrap())
+    }
+
+    fn profile(mat: &Material) -> String {
+        let mut model = Model::new(mat.w, mat.h);
+        model.resize_cells(mat.w, mat.h, mat.resolution.cells());
+        let mut tool = Tool::defaults()[0].clone();
+        tool.pass_depth = 50.0;
+        let sq = vec![Poly { pts: vec![pos2(20.0, 20.0), pos2(60.0, 20.0), pos2(60.0, 60.0), pos2(20.0, 60.0)], closed: true }];
+        let mut tp = Toolpath { id: 1, name: "P".into(), op: Op::profile(5.0, Side::On), tool, polys: sq, visible: true, chains: Arc::new(Vec::new()), length: 0.0, minutes: 0.0 };
+        tp.calculate(&model, mat);
+        gcode(&[&tp], mat)
+    }
+
+    #[test]
+    fn every_setting_changes_the_output() {
+        let base = Material::default();
+        let ((x0, y0), z0, safe0) = first_moves(&profile(&base));
+        assert_eq!((z0, safe0), (-5.0, 5.0));
+        assert!((x0 == 20.0 || x0 == 60.0) && (y0 == 20.0 || y0 == 60.0), "starts on a corner of the square");
+
+        // Safe Z
+        let m = Material { safe_z: 12.0, ..base.clone() };
+        assert_eq!(first_moves(&profile(&m)).2, 12.0);
+
+        // Z zero on the machine bed: every Z is lifted by the thickness
+        let m = Material { z_bed: true, ..base.clone() };
+        let (_, z, safe) = first_moves(&profile(&m));
+        assert_eq!((z, safe), (15.0, 25.0));
+
+        // XY datum and offset
+        // (the same corner, shifted by where X0 Y0 now is)
+        for (origin, shift) in [(Origin::TopRight, (-300.0, -200.0)), (Origin::Center, (-150.0, -100.0)), (Origin::BottomRight, (-300.0, 0.0)), (Origin::TopLeft, (0.0, -200.0))] {
+            let m = Material { origin, ..base.clone() };
+            assert_eq!(first_moves(&profile(&m)).0, (x0 + shift.0, y0 + shift.1), "{origin:?}");
+        }
+        let m = Material { use_offset: true, offset: [100.0, 50.0], ..base.clone() };
+        assert_eq!(first_moves(&profile(&m)).0, (x0 + 100.0, y0 + 50.0));
+
+        // Thickness: 3D roughing never goes below the material
+        let thin = Material { thickness: 4.0, ..base.clone() };
+        let mut model = Model::new(thin.w, thin.h);
+        model.rebuild();
+        let rough = generate(&Op::Rough3D { allowance: 0.0 }, &Tool::defaults()[0], &[], &model, &thin);
+        assert!(rough.iter().flatten().all(|p| p[2] >= -4.0 - 1e-4));
+
+        // Size and resolution: the model grid follows them
+        let mut model = Model::new(base.w, base.h);
+        let before = model.grid.nx * model.grid.ny;
+        model.resize_cells(base.w, base.h, Resolution::Highest.cells());
+        assert!(model.grid.nx * model.grid.ny > before * 2);
+        model.resize_cells(600.0, 200.0, Resolution::Standard.cells());
+        assert!((model.grid.nx as f32 * model.grid.cell - 600.0).abs() < model.grid.cell);
+    }
+}

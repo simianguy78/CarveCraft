@@ -391,74 +391,96 @@ pub fn icon_tile(ui: &mut Ui, dark: bool, icon: &str, selected: bool, tip: &str)
     resp.on_hover_text(tip)
 }
 
-/// A small wooden block, as in the original's Job Setup pictures.
-fn block(p: &Painter, base: Pos2, w: f32, d: f32, h: f32, top_col: Color32) -> [Pos2; 4] {
-    let wood = Color32::from_rgb(214, 170, 122);
-    let skew = vec2(d * 0.7, -d * 0.5);
-    let fl = base;
-    let fr = base + vec2(w, 0.0);
-    let top = [fl - vec2(0.0, h), fr - vec2(0.0, h), fr - vec2(0.0, h) + skew, fl - vec2(0.0, h) + skew];
-    p.add(Shape::convex_polygon(vec![fl, fr, top[1], top[0]], wood.gamma_multiply(0.82), Stroke::NONE));
-    p.add(Shape::convex_polygon(vec![fr, fr + skew, top[2], top[1]], wood.gamma_multiply(0.62), Stroke::NONE));
-    p.add(Shape::convex_polygon(top.to_vec(), top_col, Stroke::NONE));
-    top
+/// Shades of the app's blue for the pictures: light top, mid front, dark side.
+pub const BLUE_TOP: Color32 = Color32::from_rgb(120, 178, 255);
+pub const BLUE_FRONT: Color32 = Color32::from_rgb(61, 139, 253);
+pub const BLUE_SIDE: Color32 = Color32::from_rgb(34, 92, 196);
+const GLOW: Color32 = Color32::from_rgb(255, 196, 64);
+
+/// A rounded isometric slab: flat-shaded blue faces with a soft white rim on the top.
+fn slab(p: &Painter, c: Pos2, w: f32, d: f32, h: f32, top: Color32) -> [Pos2; 4] {
+    // isometric axes: x goes right-down, y goes right-up
+    let ax = vec2(0.866, 0.5) * w * 0.5;
+    let ay = vec2(0.866, -0.5) * d * 0.5;
+    let up = vec2(0.0, -h);
+    let t = [c - ax - ay + up, c + ax - ay + up, c + ax + ay + up, c - ax + ay + up];
+    let b = [c - ax - ay, c + ax - ay, c + ax + ay];
+    p.add(Shape::convex_polygon(vec![b[0], b[1], t[1], t[0]], BLUE_FRONT, Stroke::NONE));
+    p.add(Shape::convex_polygon(vec![b[1], b[2], t[2], t[1]], BLUE_SIDE, Stroke::NONE));
+    p.add(Shape::convex_polygon(t.to_vec(), top, Stroke::new(1.0_f32, Color32::from_white_alpha(140))));
+    t
 }
 
-/// Pictures for the Job Setup sections: "type", "size", "zzero" (on = machine bed),
-/// "datum", "resolution".
+fn arrow_line(p: &Painter, a: Pos2, b: Pos2, col: Color32) {
+    let s = Stroke::new(1.3_f32, col);
+    p.line_segment([a, b], s);
+    let d = (b - a).normalized() * 4.0;
+    for (q, dir) in [(a, d), (b, -d)] {
+        p.line_segment([q, q + dir + dir.rot90() * 0.7], s);
+        p.line_segment([q, q + dir - dir.rot90() * 0.7], s);
+    }
+}
+
+/// Pictures for the Job Setup sections, in CarveCraft's own blue style: "type", "size",
+/// "zzero" (on = machine bed), "datum", "resolution".
 pub fn job_art(p: &Painter, r: Rect, which: &str, on: bool) {
-    let wood = Color32::from_rgb(214, 170, 122);
-    let red = Color32::from_rgb(220, 60, 50);
-    let ink = Color32::from_rgb(120, 128, 140);
-    let s = Stroke::new(1.2_f32, ink);
-    let o = r.left_bottom() + vec2(4.0, -8.0);
+    // every picture sits on a soft rounded blue tile
+    p.rect_filled(r.shrink(1.0), CornerRadius::same(10), BLUE_FRONT.gamma_multiply(0.14));
+    let c = r.center() + vec2(-2.0, 8.0);
+    let ink = Color32::from_rgb(170, 200, 245);
+    let font = FontId::proportional(9.0);
     match which {
         "type" => {
-            // a block standing on a grey bed
-            p.add(Shape::convex_polygon(vec![o + vec2(-2.0, 4.0), o + vec2(38.0, 4.0), o + vec2(52.0, -6.0), o + vec2(12.0, -6.0)], Color32::from_rgb(170, 175, 182), Stroke::NONE));
-            block(p, o + vec2(4.0, -2.0), 30.0, 18.0, 20.0, wood);
+            // one slab with a downward arrow: cut from the top side
+            slab(p, c + vec2(0.0, 4.0), 30.0, 22.0, 9.0, BLUE_TOP);
+            let a = c + vec2(0.0, -24.0);
+            p.line_segment([a, a + vec2(0.0, 12.0)], Stroke::new(2.0_f32, GLOW));
+            p.add(Shape::convex_polygon(vec![a + vec2(-4.0, 10.0), a + vec2(4.0, 10.0), a + vec2(0.0, 15.0)], GLOW, Stroke::NONE));
         }
         "size" => {
-            let top = block(p, o + vec2(4.0, -6.0), 32.0, 20.0, 26.0, wood);
-            // dimension lines with X, Y and Z
-            let font = FontId::proportional(9.0);
-            p.line_segment([o + vec2(4.0, 0.0), o + vec2(36.0, 0.0)], s);
-            p.text(o + vec2(20.0, 2.0), Align2::CENTER_TOP, "X", font.clone(), ink);
-            p.line_segment([o + vec2(40.0, -8.0), o + vec2(53.0, -18.0)], s);
-            p.text(o + vec2(50.0, -10.0), Align2::LEFT_TOP, "Y", font.clone(), ink);
-            p.line_segment([top[2] + vec2(4.0, 0.0), top[2] + vec2(4.0, 26.0)], s);
-            p.text(top[2] + vec2(7.0, 10.0), Align2::LEFT_CENTER, "Z", font, ink);
+            let t = slab(p, c + vec2(-3.0, 2.0), 28.0, 20.0, 16.0, BLUE_TOP);
+            // dimension arrows for X, Y and Z
+            let x0 = t[0] + vec2(0.0, 16.0 + 5.0);
+            arrow_line(p, x0, x0 + (t[1] - t[0]), ink);
+            p.text(x0 + (t[1] - t[0]) * 0.5 + vec2(-3.0, 3.0), Align2::CENTER_TOP, "X", font.clone(), ink);
+            let y0 = t[1] + vec2(5.0, 16.0 + 2.0);
+            arrow_line(p, y0, y0 + (t[2] - t[1]), ink);
+            p.text(y0 + (t[2] - t[1]) * 0.5 + vec2(5.0, 2.0), Align2::LEFT_CENTER, "Y", font.clone(), ink);
+            let z0 = t[2] + vec2(5.0, 0.0);
+            arrow_line(p, z0, z0 + vec2(0.0, 16.0), ink);
+            p.text(z0 + vec2(4.0, 8.0), Align2::LEFT_CENTER, "Z", font, ink);
         }
         "zzero" => {
-            let top = block(p, o + vec2(4.0, -2.0), 34.0, 20.0, 22.0, wood);
-            if on {
-                // red outline on the bed under the block
-                let b = o + vec2(4.0, -2.0);
-                let skew = vec2(14.0, -10.0);
-                p.add(Shape::closed_line(vec![b, b + vec2(34.0, 0.0), b + vec2(34.0, 0.0) + skew, b + skew], Stroke::new(2.0_f32, red)));
-            } else {
-                p.add(Shape::closed_line(top.to_vec(), Stroke::new(2.0_f32, red)));
-            }
+            let t = slab(p, c + vec2(0.0, 2.0), 30.0, 22.0, 14.0, BLUE_TOP);
+            // a glowing plane marks where Z0 is: the top face or the bed under the slab
+            let plane: Vec<Pos2> = if on { t.iter().map(|q| *q + vec2(0.0, 14.0)).collect() } else { t.to_vec() };
+            p.add(Shape::closed_line(plane.clone(), Stroke::new(2.0_f32, GLOW)));
+            // label it on the plane itself, so it never runs off the picture
+            let mid = plane.iter().fold(vec2(0.0, 0.0), |a, q| a + q.to_vec2()) / 4.0;
+            p.text(mid.to_pos2(), Align2::CENTER_CENTER, "Z0", FontId::proportional(9.5), if on { GLOW } else { BLUE_SIDE });
         }
         "datum" => {
-            // a sheet seen at an angle with a red dot at the chosen corner
-            let sheet = [o + vec2(0.0, -2.0), o + vec2(32.0, -2.0), o + vec2(50.0, -20.0), o + vec2(18.0, -20.0)];
-            p.add(Shape::convex_polygon(sheet.to_vec(), wood, Stroke::NONE));
-            p.line_segment([sheet[0] + vec2(0.0, 3.0), sheet[1] + vec2(0.0, 3.0)], Stroke::new(3.0_f32, wood.gamma_multiply(0.7)));
-            p.circle_filled(sheet[0], 4.0, red);
+            // seen from above: a sheet with a crosshair at its X0 Y0 corner
+            let sheet = Rect::from_center_size(c + vec2(2.0, -6.0), vec2(36.0, 26.0));
+            p.rect_filled(sheet, CornerRadius::same(3), BLUE_TOP);
+            p.rect_stroke(sheet, CornerRadius::same(3), Stroke::new(1.0_f32, Color32::from_white_alpha(140)), egui::StrokeKind::Inside);
+            let o = sheet.left_bottom();
+            p.circle_stroke(o, 5.0, Stroke::new(1.6_f32, GLOW));
+            p.line_segment([o + vec2(-8.0, 0.0), o + vec2(8.0, 0.0)], Stroke::new(1.3_f32, GLOW));
+            p.line_segment([o + vec2(0.0, -8.0), o + vec2(0.0, 8.0)], Stroke::new(1.3_f32, GLOW));
         }
         _ => {
-            // resolution: a coarse stair next to a fine slope
-            for k in 0..5 {
-                let x = o.x + 2.0 + k as f32 * 5.0;
-                let h = 6.0 + k as f32 * 5.0;
-                p.rect_filled(Rect::from_min_max(pos2(x, o.y - h), pos2(x + 5.0, o.y)), 0.0, wood.gamma_multiply(0.6 + 0.08 * k as f32));
+            // resolution: the same curve drawn coarse, then fine
+            let base = c + vec2(-24.0, 6.0);
+            for (k, (cells, x0)) in [(5, 0.0), (14, 26.0)].iter().enumerate() {
+                let w = 22.0 / *cells as f32;
+                for i in 0..*cells {
+                    let t = (i as f32 + 0.5) / *cells as f32;
+                    let h = 4.0 + 18.0 * (t * std::f32::consts::PI).sin();
+                    let col = if k == 0 { BLUE_SIDE } else { BLUE_FRONT };
+                    p.rect_filled(Rect::from_min_max(base + vec2(x0 + i as f32 * w, -h), base + vec2(x0 + (i + 1) as f32 * w - 0.6, 0.0)), 0.0, col);
+                }
             }
-            let fine: Vec<Pos2> = (0..=24).map(|k| o + vec2(30.0 + k as f32, -(6.0 + k as f32))).collect();
-            let mut poly = fine.clone();
-            poly.push(o + vec2(54.0, 0.0));
-            poly.push(o + vec2(30.0, 0.0));
-            p.add(Shape::convex_polygon(poly, wood, Stroke::NONE));
         }
     }
 }

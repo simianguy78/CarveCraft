@@ -347,7 +347,9 @@ impl App {
                             ui.separator();
                         }
                         let m = &self.doc.material;
-                        ui.label(RichText::new(format!("Material {} × {} × {} mm", m.w, m.h, m.thickness)).color(pal.weak));
+                        let (k, u) = if m.inches { (1.0 / 25.4, "in") } else { (1.0, "mm") };
+                        let f = |v: f32| format!("{:.3}", v * k).trim_end_matches('0').trim_end_matches('.').to_string();
+                        ui.label(RichText::new(format!("Material {} × {} × {} {u}", f(m.w), f(m.h), f(m.thickness))).color(pal.weak));
                     });
                 });
             });

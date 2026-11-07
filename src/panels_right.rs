@@ -112,23 +112,15 @@ impl App {
         let mut set = false;
         card(ui, dark, "Material Setup", |ui| {
             ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(46.0, 40.0), egui::Sense::hover());
-                let p = ui.painter();
-                let wood = Color32::from_rgb(214, 170, 122);
-                let top = [r.left_top() + vec2(4.0, 12.0), r.left_top() + vec2(26.0, 4.0), r.right_top() + vec2(-2.0, 10.0), r.left_top() + vec2(22.0, 18.0)];
-                let drop = vec2(0.0, 14.0);
-                p.add(egui::Shape::convex_polygon(vec![top[0], top[3], top[3] + drop, top[0] + drop], wood.gamma_multiply(0.8), egui::Stroke::NONE));
-                p.add(egui::Shape::convex_polygon(vec![top[3], top[2], top[2] + drop, top[3] + drop], wood.gamma_multiply(0.6), egui::Stroke::NONE));
-                p.add(egui::Shape::convex_polygon(top.to_vec(), wood, egui::Stroke::NONE));
-                // The red outline marks where Z zero is: the top face or the bed.
-                let zero: Vec<_> = if m.z_bed { top.iter().map(|q| *q + drop).collect() } else { top.to_vec() };
-                p.add(egui::Shape::closed_line(zero, egui::Stroke::new(1.5_f32, Color32::from_rgb(235, 87, 87))));
+                let (r, _) = ui.allocate_exact_size(vec2(54.0, 46.0), egui::Sense::hover());
+                icons::job_art(ui.painter(), r, "zzero", m.z_bed);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(format!("Thickness {} mm", m.thickness)).strong());
+                    let (k, u) = if m.inches { (1.0 / 25.4, "in") } else { (1.0, "mm") };
+                    ui.label(RichText::new(format!("Thickness {:.3} {u}", m.thickness * k).replace(".000 ", " ")).strong());
                     let z = if m.z_bed { "Z zero: machine bed" } else { "Z zero: material top" };
                     ui.label(RichText::new(z).small().color(pal.weak));
                     let datum = format!("XY datum: {}", m.origin.label().replace(" corner", ""));
-                    ui.label(RichText::new(format!("{datum} · safe Z {} mm", m.safe_z)).small().color(pal.weak));
+                    ui.label(RichText::new(format!("{datum} · safe Z {} {u}", format!("{:.2}", m.safe_z * k).trim_end_matches('0').trim_end_matches('.'))).small().color(pal.weak));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Set…").clicked() {
