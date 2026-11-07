@@ -14,6 +14,9 @@ pub struct Library {
     pub materials: Vec<String>,
     /// The material whose feeds and speeds the tools currently show.
     pub material: String,
+    /// Spindle and feed limits used by the feeds & speeds calculator.
+    #[serde(default)]
+    pub machine: crate::feeds::Machine,
 }
 
 fn library_file() -> Option<PathBuf> {
@@ -64,7 +67,7 @@ pub fn default_library() -> Library {
         t("Engraving", "Engraving 30°", ToolKind::VBit, 3.0, 30.0, 0.2, 0.5, 800.0, 20000.0),
         t("Engraving", "Engraving 15°", ToolKind::VBit, 3.0, 15.0, 0.1, 0.3, 600.0, 22000.0),
     ];
-    Library { tools, materials: ["Default", "Softwood", "Hardwood", "MDF", "Plywood", "Plastic (acrylic)", "Aluminium"].map(String::from).to_vec(), material: "Default".into() }
+    Library { tools, materials: ["Default", "Softwood", "Hardwood", "MDF", "Plywood", "Plastic (acrylic)", "Aluminium"].map(String::from).to_vec(), material: "Default".into(), machine: Default::default() }
 }
 
 /// The library tool nearest to what an operation usually wants (kind, then size/angle).
@@ -100,13 +103,14 @@ pub fn switch_material(lib: &mut Library, material: &str) {
 
 impl App {
     fn library(&self) -> Library {
-        Library { tools: self.tools.clone(), materials: self.tool_materials.clone(), material: self.tool_material.clone() }
+        Library { tools: self.tools.clone(), materials: self.tool_materials.clone(), material: self.tool_material.clone(), machine: self.fs_machine.clone() }
     }
 
     fn set_library(&mut self, lib: Library) {
         self.tools = lib.tools;
         self.tool_materials = lib.materials;
         self.tool_material = lib.material;
+        self.fs_machine = lib.machine;
         self.tool_idx = self.tool_idx.min(self.tools.len().saturating_sub(1));
         self.db_sel = self.db_sel.min(self.tools.len().saturating_sub(1));
     }
@@ -119,6 +123,7 @@ impl App {
         let mut open = true;
         let mut changed = false;
         let mut cmd: Option<&'static str> = None;
+        let mut open_calc: Option<usize> = None;
         let pal = theme::palette(self.dark);
         egui::Window::new("Tool Database").open(&mut open).default_size([780.0, 640.0]).collapsible(false).show(ctx, |ui| {
             // Material picker, like the original's top bar.
@@ -160,9 +165,17 @@ impl App {
                                 for i in (0..self.tools.len()).filter(|i| self.tools[*i].group == g) {
                                     let t = &self.tools[i];
                                     let label = format!("{}  #{}", t.name, t.number);
-                                    if ui.selectable_label(self.db_sel == i, label).clicked() {
-                                        self.db_sel = i;
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(self.db_sel == i, label).clicked() {
+                                            self.db_sel = i;
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button("Check").on_hover_text("Check this tool's feeds and speeds").clicked() {
+                                                self.db_sel = i;
+                                                open_calc = Some(i);
+                                            }
+                                        });
+                                    });
                                 }
                             });
                         }
@@ -241,7 +254,12 @@ impl App {
                         ui.end_row();
                     });
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Feeds and speeds").strong());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Feeds and speeds").strong());
+                        if ui.small_button("Feeds & Speeds calculator…").on_hover_text("Recommend settings for this tool, material and machine").clicked() {
+                            open_calc = Some(self.db_sel);
+                        }
+                    });
                     egui::Grid::new("tooldb_feeds").num_columns(2).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
                         ui.label("Spindle speed");
                         ui.add(egui::DragValue::new(&mut t.rpm).range(100.0..=60000.0).speed(50.0).suffix(" r.p.m"));
@@ -273,6 +291,12 @@ impl App {
                 });
             });
         });
+        if let Some(i) = open_calc {
+            self.fs_calc = Some(FsCalc { tool: i, stock: crate::feeds::Stock::from_name(&self.tool_material), apply: [true; 5] });
+        }
+        if self.feeds_window(ctx) {
+            changed = true;
+        }
         let sel = self.db_sel.min(self.tools.len().saturating_sub(1));
         match cmd {
             Some("add") | Some("copy") | Some("group") => {
@@ -332,6 +356,136 @@ impl App {
         if changed {
             save(&self.library());
         }
+    }
+}
+
+/// The calculator's state: which tool, which material, and which values to apply.
+pub struct FsCalc {
+    pub tool: usize,
+    pub stock: crate::feeds::Stock,
+    /// Spindle speed, feed, plunge, pass depth, stepover.
+    pub apply: [bool; 5],
+}
+
+impl App {
+    /// The Feeds & Speeds calculator window. Returns true when values were applied to a tool.
+    fn feeds_window(&mut self, ctx: &egui::Context) -> bool {
+        use crate::feeds::{advise, Rigidity, Stock};
+        let Some(calc) = self.fs_calc.as_mut() else { return false };
+        let Some(tool) = self.tools.get(calc.tool).cloned() else {
+            self.fs_calc = None;
+            return false;
+        };
+        let pal = theme::palette(self.dark);
+        let mut open = true;
+        let mut action: Option<bool> = None;
+        let machine = &mut self.fs_machine;
+        egui::Window::new("Feeds & Speeds calculator").open(&mut open).default_width(520.0).collapsible(false).order(egui::Order::Foreground).show(ctx, |ui| {
+            // What was loaded from the tool
+            ui.label(RichText::new(format!("{}  #{}", tool.name, tool.number)).strong().size(15.0));
+            let shape = if tool.kind == ToolKind::VBit { format!("{} · {:.0}° · {} mm", tool.kind.label(), tool.angle, tool.diameter) } else { format!("{} · {} mm", tool.kind.label(), tool.diameter) };
+            ui.label(RichText::new(format!("{shape} · {} flutes", tool.flutes)).color(pal.weak));
+            ui.add_space(6.0);
+            egui::Grid::new("fs_inputs").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                ui.label("Material");
+                egui::ComboBox::from_id_salt("fs_stock").width(220.0).selected_text(calc.stock.label()).show_ui(ui, |ui| {
+                    for s in Stock::ALL {
+                        ui.selectable_value(&mut calc.stock, s, s.label());
+                    }
+                });
+                ui.end_row();
+                ui.label("Machine");
+                egui::ComboBox::from_id_salt("fs_rig").width(220.0).selected_text(machine.rigidity.label()).show_ui(ui, |ui| {
+                    for r in Rigidity::ALL {
+                        ui.selectable_value(&mut machine.rigidity, r, r.label());
+                    }
+                });
+                ui.end_row();
+                ui.label("Spindle range");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut machine.min_rpm).range(1000.0..=60000.0).speed(100.0));
+                    ui.label("to");
+                    ui.add(egui::DragValue::new(&mut machine.max_rpm).range(1000.0..=60000.0).speed(100.0).suffix(" r.p.m"));
+                });
+                ui.end_row();
+                ui.label("Fastest feed");
+                ui.add(egui::DragValue::new(&mut machine.max_feed).range(100.0..=40000.0).speed(10.0).suffix(" mm/min"));
+                ui.end_row();
+            });
+            machine.max_rpm = machine.max_rpm.max(machine.min_rpm);
+            ui.add_space(8.0);
+
+            // Current against recommended, with a tick for each value to use
+            let adv = advise(&tool, calc.stock, machine);
+            let rows = [
+                ("Spindle speed", tool.rpm, adv.rpm, " r.p.m", 0),
+                ("Feed rate", tool.feed, adv.feed, " mm/min", 0),
+                ("Plunge rate", tool.plunge, adv.plunge, " mm/min", 0),
+                ("Pass depth", tool.pass_depth, adv.pass_depth, " mm", 2),
+                ("Stepover", tool.stepover, adv.stepover, " mm", 3),
+            ];
+            egui::Frame::new().fill(pal.card).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::Grid::new("fs_results").num_columns(4).spacing(vec2(18.0, 6.0)).striped(true).show(ui, |ui| {
+                    ui.label(RichText::new("Use").small().color(pal.weak));
+                    ui.label(RichText::new("Setting").small().color(pal.weak));
+                    ui.label(RichText::new("Current").small().color(pal.weak));
+                    ui.label(RichText::new("Recommended").small().color(pal.weak));
+                    ui.end_row();
+                    for (k, (name, cur, rec, unit, dp)) in rows.iter().enumerate() {
+                        ui.checkbox(&mut calc.apply[k], "");
+                        ui.label(*name);
+                        ui.label(format!("{:.*}{unit}", dp, cur));
+                        // highlight values more than 15% away from the current ones
+                        let far = (rec - cur).abs() > cur.abs().max(1e-3) * 0.15;
+                        let col = if far { Color32::from_rgb(255, 184, 77) } else { pal.text };
+                        ui.label(RichText::new(format!("{:.*}{unit}", dp, rec)).strong().color(col));
+                        ui.end_row();
+                    }
+                });
+                let cur_chip = tool.feed / (tool.rpm.max(1.0) * tool.flutes.max(1) as f32);
+                ui.label(RichText::new(format!("Chip load: now {cur_chip:.3} mm per tooth, recommended {:.3}", adv.chip_load)).small().color(pal.weak));
+            });
+            for n in &adv.notes {
+                ui.label(RichText::new(format!("⚠ {n}")).color(Color32::from_rgb(240, 160, 60)));
+            }
+            ui.label(RichText::new("Starting values: test on scrap and adjust by sound and chips.").small().color(pal.weak));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let n = calc.apply.iter().filter(|a| **a).count();
+                let use_btn = egui::Button::new(RichText::new(format!("Use ticked values ({n})")).color(Color32::WHITE).strong()).fill(ACCENT);
+                if ui.add_enabled(n > 0, use_btn).clicked() {
+                    action = Some(true);
+                }
+                if ui.button("Keep current values").clicked() {
+                    action = Some(false);
+                }
+            });
+        });
+        let mut applied = false;
+        if action == Some(true) {
+            if let Some(calc) = self.fs_calc.take() {
+                let adv = advise(&tool, calc.stock, &self.fs_machine);
+                if let Some(t) = self.tools.get_mut(calc.tool) {
+                    let vals = [adv.rpm, adv.feed, adv.plunge, adv.pass_depth, adv.stepover];
+                    let slots: [&mut f32; 5] = [&mut t.rpm, &mut t.feed, &mut t.plunge, &mut t.pass_depth, &mut t.stepover];
+                    for ((slot, v), on) in slots.into_iter().zip(vals).zip(calc.apply) {
+                        if on {
+                            *slot = v;
+                        }
+                    }
+                    self.status = format!("Feeds and speeds updated for {} ({})", t.name, self.tool_material);
+                }
+                applied = true;
+            }
+        } else if action == Some(false) || !open {
+            self.fs_calc = None;
+        }
+        // the machine limits are worth keeping even when nothing is applied
+        if applied || action.is_some() || !open {
+            save(&self.library());
+        }
+        applied
     }
 }
 

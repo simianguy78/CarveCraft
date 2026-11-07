@@ -1,6 +1,7 @@
 mod app;
 mod cam;
 mod export;
+mod feeds;
 mod geom;
 mod icons;
 mod model;

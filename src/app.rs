@@ -244,6 +244,8 @@ pub struct App {
     pub tool_materials: Vec<String>,
     pub tool_material: String,
     pub db_sel: usize,
+    pub fs_calc: Option<crate::tooldb::FsCalc>,
+    pub fs_machine: crate::feeds::Machine,
     /// Node editing: the picked node (shape id, index), corners with a locked angle,
     /// the segment length being typed, and where last frame's length labels were drawn.
     pub node_sel: Option<(u64, usize)>,
@@ -324,6 +326,8 @@ impl App {
             tool_materials: Vec::new(),
             tool_material: String::new(),
             db_sel: 0,
+            fs_calc: None,
+            fs_machine: Default::default(),
             node_sel: None,
             len_edit: None,
             node_len_tags: Vec::new(),
@@ -361,6 +365,7 @@ impl App {
             app.tools = lib.tools;
             app.tool_materials = lib.materials;
             app.tool_material = lib.material;
+            app.fs_machine = lib.machine;
             app.tool_idx = crate::tooldb::pick(&app.tools, crate::toolpath::ToolKind::BallNose, 3.0);
         }
         // Start-up view overrides, handy for checking screens: CARVECRAFT_START=2d|design|light|sim
@@ -378,6 +383,11 @@ impl App {
                 "tooldb" => {
                     app.show_tool_db = true;
                     app.db_sel = app.tool_idx;
+                }
+                "feeds" => {
+                    app.show_tool_db = true;
+                    app.db_sel = crate::tooldb::pick(&app.tools, crate::toolpath::ToolKind::EndMill, 6.35);
+                    app.fs_calc = Some(crate::tooldb::FsCalc { tool: app.db_sel, stock: crate::feeds::Stock::Hardwood, apply: [true; 5] });
                 }
                 "profile" => {
                     let mut op = Op::profile(6.0, crate::toolpath::Side::Outside);
