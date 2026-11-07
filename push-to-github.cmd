@@ -32,7 +32,13 @@ git push -u origin main
 echo.
 if errorlevel 1 (
   echo Upload failed - see the message above.
-) else (
-  echo Done: https://github.com/simianguy78/CarveCraft
+  pause
+  exit /b 1
 )
+rem After a good upload, refresh our copy of GitHub's state and clear out anything no
+rem longer used (such as the old-email history this replaced), so no trace stays here.
+git fetch origin --prune -q
+git reflog expire --expire=now --all
+git gc --prune=now -q
+echo Done: https://github.com/simianguy78/CarveCraft
 pause
